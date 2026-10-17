@@ -4,9 +4,15 @@ import {
   Injectable,
   Logger,
   OnModuleDestroy,
+  OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import puppeteer, { Browser, Page } from 'puppeteer';
+import puppeteer, {
+  Browser,
+  BrowserContext,
+  ElementHandle,
+  Page,
+} from 'puppeteer';
 import { NameGeneratorService } from '../name-generator/name-generator.service';
 import { ParsedZoomLink } from './zoom-url.util';
 
@@ -16,8 +22,17 @@ export const MAX_BOTS_PER_MEETING = 500;
 /** Bots that fail one after another before we stop starting new ones. */
 const MAX_FAILURES_IN_A_ROW = 3;
 
+/** How often to look for bots whose meeting ended, to free their browser tabs. */
+const SWEEP_INTERVAL_MS = 30_000;
+
+/** Failure screenshots kept on disk; older ones are deleted. */
+const MAX_SCREENSHOTS = 20;
+
+/** After we fill a passcode/email, how long Zoom may keep showing the field before we call it rejected. */
+const DETAIL_ACCEPT_WAIT_MS = 15_000;
+
 /** Appended to every generated name so the room can tell the bots from people. */
-const BOT_NAME_TAG = '';
+const BOT_NAME_TAG = ' (bot)';
 
 /** Details only some meetings ask for; the user supplies them on request. */
 export interface JoinDetails {
@@ -26,6 +41,16 @@ export interface JoinDetails {
 }
 
 export type JoinNeed = keyof JoinDetails;
+
+const MISSING_DETAIL: Record<JoinNeed, string> = {
+  passcode: 'This meeting needs a passcode.',
+  email: 'This meeting asks for an email address (usually a webinar).',
+};
+
+const REJECTED_DETAIL: Record<JoinNeed, string> = {
+  passcode: 'Zoom rejected that passcode.',
+  email: 'Zoom rejected that email address.',
+};
 
 /** Zoom asked for a detail we don't have: ask the user, then join again. */
 export class JoinNeedsInputError extends Error {
@@ -37,14 +62,29 @@ export class JoinNeedsInputError extends Error {
   }
 }
 
+/** The join was stopped with leave() before it finished. */
+export class JoinCancelledError extends Error {}
+
+/** A bot couldn't join; carries what the page showed, when it could be captured. */
+export class JoinFailedError extends Error {
+  screenshot?: Buffer;
+}
+
 /** The meeting won't admit any bot (ended, invalid, signed-in users only). */
-class MeetingClosedError extends Error {}
+class MeetingClosedError extends JoinFailedError {}
 
 /** The meeting is at its participant limit, so no further bot will get in. */
-class MeetingFullError extends Error {}
+class MeetingFullError extends JoinFailedError {}
 
 /** Places a bot can sit after clicking Join that the user should hear about. */
 export type JoinWait = 'waiting-room' | 'waiting-for-host';
+
+export interface JoinEvents {
+  /** Called once per waiting state (e.g. the waiting room). */
+  onWait?: (state: JoinWait) => void;
+  /** Called if the bots later leave without being asked (meeting ended, all removed). */
+  onEnded?: (reason: string) => void;
+}
 
 export interface JoinResult {
   /** Display names of the bots now in the meeting. */
@@ -53,6 +93,8 @@ export interface JoinResult {
   failed: number;
   /** Why the first of them failed. */
   failureReason?: string;
+  /** What that bot's page showed when it failed. */
+  failureScreenshot?: Buffer;
 }
 
 type JoinState =
@@ -64,24 +106,38 @@ type JoinState =
   | 'full'
   | 'pending';
 
+interface BotTab {
+  name: string;
+  context: BrowserContext;
+  page: Page;
+}
+
+/** One meeting's browser and the bots in it, tracked from the start of the join. */
 interface MeetingSession {
   browser: Browser;
-  displayNames: string[];
   link: ParsedZoomLink;
-  joinedAt: Date;
+  /** Bots in the meeting; grows while the join is still running. */
+  bots: BotTab[];
+  joining: boolean;
+  onEnded?: (reason: string) => void;
 }
 
 @Injectable()
-export class ZoomService implements OnModuleDestroy {
+export class ZoomService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ZoomService.name);
+  /** Per meeting number: meetings the bots are in or joining. */
   private readonly sessions = new Map<string, MeetingSession>();
-  /** Meetings with a join in progress, which can take minutes in a waiting room. */
-  private readonly joining = new Set<string>();
+  private sweepTimer?: NodeJS.Timeout;
+  private sweeping = false;
 
   constructor(
     private readonly config: ConfigService,
     private readonly names: NameGeneratorService,
   ) {}
+
+  onModuleInit(): void {
+    this.sweepTimer = setInterval(() => void this.sweep(), SWEEP_INTERVAL_MS);
+  }
 
   activeCount(): number {
     return this.sessions.size;
@@ -91,13 +147,18 @@ export class ZoomService implements OnModuleDestroy {
     return [...this.sessions.keys()];
   }
 
+  /** True while the bots are in the meeting or still joining it. */
   isInMeeting(meetingNumber: string): boolean {
     return this.sessions.has(meetingNumber);
   }
 
-  /** The display names the bots in a meeting joined as. */
+  isJoining(meetingNumber: string): boolean {
+    return this.sessions.get(meetingNumber)?.joining ?? false;
+  }
+
+  /** The display names of the bots in a meeting so far. */
   displayNamesIn(meetingNumber: string): string[] {
-    return this.sessions.get(meetingNumber)?.displayNames ?? [];
+    return this.sessions.get(meetingNumber)?.bots.map((b) => b.name) ?? [];
   }
 
   /**
@@ -109,16 +170,16 @@ export class ZoomService implements OnModuleDestroy {
    * Problems with the meeting itself (needs a passcode, ended, signed-in users
    * only) stop the whole join. A single bot failing only drops that bot; a
    * full meeting, or MAX_FAILURES_IN_A_ROW failures, stops new bots starting.
+   * leave() during the join stops it and makes this throw JoinCancelledError.
    *
    * @param details passcode/email, for meetings whose join page asks for them
-   * @param onWait called once per waiting state (e.g. the waiting room)
    * @throws JoinNeedsInputError when Zoom asks for a detail not in `details`
    */
   async join(
     link: ParsedZoomLink,
     details: JoinDetails,
     botCount: number,
-    onWait?: (state: JoinWait) => void,
+    events: JoinEvents = {},
   ): Promise<JoinResult> {
     const { meetingNumber } = link;
     if (
@@ -130,28 +191,42 @@ export class ZoomService implements OnModuleDestroy {
         `The number of bots must be from 1 to ${MAX_BOTS_PER_MEETING}; got ${botCount}.`,
       );
     }
-    if (this.sessions.has(meetingNumber) || this.joining.has(meetingNumber)) {
+    if (this.sessions.has(meetingNumber)) {
       throw new Error(`Already in or joining meeting ${meetingNumber}.`);
     }
-    this.joining.add(meetingNumber);
+    const session: MeetingSession = {
+      browser: await this.launchBrowser(),
+      link,
+      bots: [],
+      joining: true,
+      onEnded: events.onEnded,
+    };
+    this.sessions.set(meetingNumber, session);
     try {
-      return await this.joinAll(link, details, botCount, onWait);
+      return await this.joinAll(session, details, botCount, events.onWait);
+    } catch (err) {
+      if (this.sessions.get(meetingNumber) === session) {
+        await this.leave(meetingNumber);
+      }
+      throw err;
     } finally {
-      this.joining.delete(meetingNumber);
+      session.joining = false;
     }
   }
 
   private async joinAll(
-    link: ParsedZoomLink,
+    session: MeetingSession,
     details: JoinDetails,
     botCount: number,
     onWait?: (state: JoinWait) => void,
   ): Promise<JoinResult> {
+    const { browser, link } = session;
     const displayNames = this.pickDisplayNames(botCount);
-    const browser = await this.launchBrowser();
     // Loading the join page is the heavy part, so only a few bots do it at
     // once; each frees its slot as soon as it has clicked Join.
     const slots = new Slots(this.joinConcurrency());
+    // leave() removes the session and closes the browser under the bots.
+    const cancelled = () => this.sessions.get(link.meetingNumber) !== session;
 
     // The bots land in the same waiting room; tell the user once.
     const announced = new Set<JoinWait>();
@@ -162,7 +237,6 @@ export class ZoomService implements OnModuleDestroy {
       }
     };
 
-    const joined: string[] = [];
     let firstError: unknown;
     let fatal = false; // the meeting won't take any bot: everyone leaves
     let stopped = false; // no point starting more bots
@@ -172,16 +246,16 @@ export class ZoomService implements OnModuleDestroy {
       displayNames.map(async (name, i) => {
         const release = await slots.acquire();
         try {
-          if (stopped) {
+          if (stopped || cancelled()) {
             return;
           }
-          await this.joinAs(browser, link, details, name, i + 1, announce, () => {
+          const tab = await this.joinAs(browser, link, details, name, i + 1, announce, () => {
             failuresInARow = 0;
             release();
           });
-          joined.push(name);
+          session.bots.push(tab);
         } catch (err) {
-          if (fatal) {
+          if (fatal || cancelled()) {
             return; // the browser was closed under this bot
           }
           firstError ??= err;
@@ -203,17 +277,14 @@ export class ZoomService implements OnModuleDestroy {
       }),
     );
 
-    if (fatal || joined.length === 0) {
-      await browser.close().catch(() => undefined);
-      throw firstError;
+    if (cancelled()) {
+      throw new JoinCancelledError(`Stopped joining meeting ${link.meetingNumber}.`);
+    }
+    if (fatal || session.bots.length === 0) {
+      throw firstError; // join() closes the browser
     }
 
-    this.sessions.set(link.meetingNumber, {
-      browser,
-      displayNames: joined,
-      link,
-      joinedAt: new Date(),
-    });
+    const joined = session.bots.map((b) => b.name);
     this.logger.log(
       `Joined meeting ${link.meetingNumber} with ${joined.length} of ${botCount} bots.`,
     );
@@ -226,6 +297,10 @@ export class ZoomService implements OnModuleDestroy {
           ? firstError instanceof Error
             ? firstError.message
             : String(firstError)
+          : undefined,
+      failureScreenshot:
+        failed > 0 && firstError instanceof JoinFailedError
+          ? firstError.screenshot
           : undefined,
     };
   }
@@ -243,7 +318,7 @@ export class ZoomService implements OnModuleDestroy {
     botNumber: number,
     onWait: (state: JoinWait) => void,
     joinClicked: () => void,
-  ): Promise<void> {
+  ): Promise<BotTab> {
     const stepTimeout = Number(
       this.config.get<string>('ZOOM_STEP_TIMEOUT_MS', '45000'),
     );
@@ -278,22 +353,11 @@ export class ZoomService implements OnModuleDestroy {
         throw new Error('Could not find the display-name input on the join page.');
       }
 
-      // Shown only when the link doesn't carry the passcode (no ?pwd=), and on
-      // webinars that collect an email.
-      await this.fillIfShown(
-        page,
-        this.passcodeSelectors(),
-        details.passcode,
-        'passcode',
-        'This meeting needs a passcode.',
-      );
-      await this.fillIfShown(
-        page,
-        this.emailSelectors(),
-        details.email,
-        'email',
-        'This meeting asks for an email address (usually a webinar).',
-      );
+      // A passcode field shows when the link doesn't carry one (no ?pwd=), and
+      // webinars may want an email. Some meetings ask only after Join, which
+      // waitUntilAdmitted handles.
+      const filled = new Map<JoinNeed, number>();
+      await this.fillDetailFields(page, details, filled);
 
       const joinOk = await this.clickJoin(page);
       if (!joinOk) {
@@ -301,30 +365,36 @@ export class ZoomService implements OnModuleDestroy {
       }
       joinClicked();
 
-      await this.waitUntilAdmitted(page, onWait);
+      await this.waitUntilAdmitted(
+        page,
+        details,
+        filled,
+        `Bot ${botNumber} in ${link.meetingNumber}`,
+        onWait,
+      );
       await this.handlePostJoin(page);
+      return { name: displayName, context, page };
     } catch (err) {
-      // Problems with the meeting aren't page problems, and once the browser
-      // is closed (the whole join stopped) there's no page to screenshot.
-      if (
-        err instanceof JoinNeedsInputError ||
-        err instanceof MeetingClosedError ||
-        !browser.connected
-      ) {
+      // A missing detail isn't a page problem, and once the browser is closed
+      // (the whole join stopped) there's no page left to capture.
+      if (err instanceof JoinNeedsInputError || !browser.connected) {
         throw err;
       }
-      if (!(err instanceof MeetingFullError)) {
-        await this.captureDebugScreenshot(
-          page,
-          `${link.meetingNumber}-bot${botNumber}`,
-        );
+      const failure =
+        err instanceof JoinFailedError
+          ? err
+          : new JoinFailedError(
+              `Bot ${botNumber} ("${displayName}"): ${err instanceof Error ? err.message : String(err)}`,
+            );
+      failure.screenshot = await this.captureDebugScreenshot(
+        page,
+        `${link.meetingNumber}-bot${botNumber}`,
+      );
+      // A closed meeting ends the whole join; otherwise only this bot leaves.
+      if (!(failure instanceof MeetingClosedError)) {
+        await context.close().catch(() => undefined);
       }
-      await context.close().catch(() => undefined);
-      if (err instanceof MeetingFullError) {
-        throw err;
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`Bot ${botNumber} ("${displayName}"): ${message}`);
+      throw failure;
     }
   }
 
@@ -337,7 +407,10 @@ export class ZoomService implements OnModuleDestroy {
     return [...names];
   }
 
-  /** Leave a specific meeting (closes its browser). */
+  /**
+   * Leave a meeting, or stop joining it, by closing its browser: every bot's
+   * tab goes, and with it the memory it held.
+   */
   async leave(meetingNumber: string): Promise<boolean> {
     const session = this.sessions.get(meetingNumber);
     if (!session) {
@@ -361,7 +434,48 @@ export class ZoomService implements OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    clearInterval(this.sweepTimer);
     await this.leaveAll();
+  }
+
+  /**
+   * Free the tabs of bots that are no longer in their meeting (it ended, or
+   * the host removed them). A meeting with no bots left is closed entirely
+   * and the user told why.
+   */
+  private async sweep(): Promise<void> {
+    if (this.sweeping) {
+      return;
+    }
+    this.sweeping = true;
+    try {
+      for (const [meetingNumber, session] of this.sessions) {
+        if (session.joining) {
+          continue; // the join handles its own bots until it finishes
+        }
+        let reason = 'the browser stopped unexpectedly';
+        if (session.browser.connected) {
+          reason = 'the meeting ended or the host removed them';
+          for (const bot of [...session.bots]) {
+            if (bot.page.isClosed() || (await this.readJoinState(bot.page)) === 'unavailable') {
+              await bot.context.close().catch(() => undefined);
+              session.bots.splice(session.bots.indexOf(bot), 1);
+              this.logger.log(`Bot "${bot.name}" is no longer in meeting ${meetingNumber}; closed its tab.`);
+            }
+          }
+          if (session.bots.length > 0) {
+            continue;
+          }
+        }
+        // leave() may have run while we were checking.
+        if (this.sessions.get(meetingNumber) === session) {
+          await this.leave(meetingNumber);
+          session.onEnded?.(reason);
+        }
+      }
+    } finally {
+      this.sweeping = false;
+    }
   }
 
   // ─── internals ──────────────────────────────────────────────────────────
@@ -462,27 +576,60 @@ export class ZoomService implements OnModuleDestroy {
   }
 
   /**
-   * Fill a field the join page shows only for some meetings. If it's showing
-   * and we don't have the value, stop so the user can be asked for it.
+   * Fill the passcode/email fields the page is showing, noting when each was
+   * filled in `filled`. Returns true if it filled any. If one is showing and
+   * we don't have the value, stop so the user can be asked for it; if Zoom
+   * still shows it well after we filled it, the value was rejected.
    */
-  private async fillIfShown(
+  private async fillDetailFields(
+    page: Page,
+    details: JoinDetails,
+    filled: Map<JoinNeed, number>,
+  ): Promise<boolean> {
+    let filledAny = false;
+    for (const need of ['passcode', 'email'] as const) {
+      const selectors =
+        need === 'passcode' ? this.passcodeSelectors() : this.emailSelectors();
+      const field = await this.visibleField(page, selectors);
+      if (!field) {
+        continue;
+      }
+      if (/\/signin\b/i.test(new URL(page.url()).pathname)) {
+        // Zoom's account sign-in form, not a meeting prompt; the next
+        // readJoinState reports it as sign-in-required.
+        return false;
+      }
+      const filledAt = filled.get(need);
+      if (filledAt !== undefined) {
+        // Zoom may take a moment to move on after we answer.
+        if (Date.now() - filledAt > DETAIL_ACCEPT_WAIT_MS) {
+          throw new JoinNeedsInputError(need, REJECTED_DETAIL[need]);
+        }
+        continue;
+      }
+      const value = details[need];
+      if (!value) {
+        throw new JoinNeedsInputError(need, MISSING_DETAIL[need]);
+      }
+      await field.click({ clickCount: 3 }); // select any prefilled text
+      await field.type(value, { delay: 20 });
+      filled.set(need, Date.now());
+      filledAny = true;
+    }
+    return filledAny;
+  }
+
+  private async visibleField(
     page: Page,
     selectors: string[],
-    value: string | undefined,
-    need: JoinNeed,
-    missingMessage: string,
-  ): Promise<void> {
+  ): Promise<ElementHandle | undefined> {
     for (const selector of selectors) {
       const field = await page.$(selector);
       if (field && (await field.isVisible())) {
-        if (!value) {
-          throw new JoinNeedsInputError(need, missingMessage);
-        }
-        await field.click({ clickCount: 3 });
-        await field.type(value, { delay: 20 });
-        return;
+        return field;
       }
     }
+    return undefined;
   }
 
   /**
@@ -491,14 +638,22 @@ export class ZoomService implements OnModuleDestroy {
    */
   private async waitUntilAdmitted(
     page: Page,
+    details: JoinDetails,
+    filled: Map<JoinNeed, number>,
+    label: string,
     onWait: (state: JoinWait) => void,
   ): Promise<void> {
     const timeout = Number(
       this.config.get<string>('ZOOM_ADMIT_TIMEOUT_MS', '300000'),
     );
     const deadline = Date.now() + timeout;
+    let lastState: JoinState | undefined;
     while (Date.now() < deadline) {
       const state = await this.readJoinState(page);
+      if (state !== lastState) {
+        this.logger.log(`${label}: ${state}`);
+        lastState = state;
+      }
       if (state === 'in-meeting') {
         return;
       }
@@ -508,6 +663,10 @@ export class ZoomService implements OnModuleDestroy {
       this.failIfBlocked(state);
       if (state === 'waiting-room' || state === 'waiting-for-host') {
         onWait(state);
+      } else if (await this.fillDetailFields(page, details, filled)) {
+        // A passcode/email asked for only after the first Join.
+        this.logger.log(`${label}: answered a passcode/email prompt`);
+        await this.clickJoin(page);
       }
       await this.sleep(1000);
     }
@@ -531,6 +690,11 @@ export class ZoomService implements OnModuleDestroy {
         );
         if (inMeeting) {
           return 'in-meeting';
+        }
+        // Zoom's account sign-in page (its email/password boxes aren't a
+        // meeting passcode prompt).
+        if (/\/signin\b/i.test(location.pathname)) {
+          return 'sign-in-required';
         }
         const text = document.body.innerText;
         if (/incorrect (password|passcode)|(password|passcode) (is )?(wrong|incorrect)/i.test(text)) {
@@ -561,7 +725,10 @@ export class ZoomService implements OnModuleDestroy {
   private failIfBlocked(state: JoinState): void {
     if (state === 'sign-in-required') {
       throw new MeetingClosedError(
-        "This meeting only admits signed-in Zoom users, so the bots can't join it as guests.",
+        "This meeting only admits signed-in Zoom users, so the bots can't join it as guests. " +
+          'If you host it, turn off "Only authenticated users can join meetings" and ' +
+          '"Only authenticated users can join meetings from Web client" in the Zoom web ' +
+          'portal under Settings → Meeting → Security (an account admin may have locked them).',
       );
     }
     if (state === 'unavailable') {
@@ -648,23 +815,40 @@ export class ZoomService implements OnModuleDestroy {
     }
   }
 
+  /** Screenshot of a failed join, also saved under ./debug-screenshots. */
   private async captureDebugScreenshot(
     page: Page,
     label: string,
-  ): Promise<void> {
+  ): Promise<Buffer | undefined> {
     const enabled =
       this.config.get<string>('ZOOM_DEBUG_SCREENSHOTS', 'true') !== 'false';
     if (!enabled) {
-      return;
+      return undefined;
     }
     try {
+      const image = Buffer.from(await page.screenshot({ fullPage: true }));
       const dir = pathJoin(process.cwd(), 'debug-screenshots');
       await fs.mkdir(dir, { recursive: true });
       const file = pathJoin(dir, `${label}-${Date.now()}.png`);
-      await page.screenshot({ path: file, fullPage: true });
+      await fs.writeFile(file, image);
       this.logger.warn(`Join failed — saved a debug screenshot to ${file}`);
+      await this.pruneScreenshots(dir);
+      return image;
     } catch (e) {
       this.logger.warn(`Could not save debug screenshot: ${e}`);
+      return undefined;
+    }
+  }
+
+  /** Keep only the newest MAX_SCREENSHOTS files, so the disk doesn't fill up. */
+  private async pruneScreenshots(dir: string): Promise<void> {
+    // Names end in a Date.now() timestamp, so the oldest sort first.
+    const timestamp = (f: string) => Number(f.match(/-(\d+)\.png$/)?.[1] ?? 0);
+    const files = (await fs.readdir(dir))
+      .filter((f) => f.endsWith('.png'))
+      .sort((a, b) => timestamp(a) - timestamp(b));
+    for (const file of files.slice(0, -MAX_SCREENSHOTS)) {
+      await fs.rm(pathJoin(dir, file), { force: true });
     }
   }
 
