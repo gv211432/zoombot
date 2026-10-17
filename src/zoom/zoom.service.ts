@@ -10,8 +10,11 @@ import puppeteer, { Browser, Page } from 'puppeteer';
 import { NameGeneratorService } from '../name-generator/name-generator.service';
 import { ParsedZoomLink } from './zoom-url.util';
 
-/** How many separate bot participants join each meeting. */
-const BOTS_PER_MEETING = 2;
+/** The most bot participants one join may ask for. */
+export const MAX_BOTS_PER_MEETING = 500;
+
+/** Bots that fail one after another before we stop starting new ones. */
+const MAX_FAILURES_IN_A_ROW = 3;
 
 /** Appended to every generated name so the room can tell the bots from people. */
 const BOT_NAME_TAG = ' (bot)';
@@ -34,8 +37,23 @@ export class JoinNeedsInputError extends Error {
   }
 }
 
+/** The meeting won't admit any bot (ended, invalid, signed-in users only). */
+class MeetingClosedError extends Error {}
+
+/** The meeting is at its participant limit, so no further bot will get in. */
+class MeetingFullError extends Error {}
+
 /** Places a bot can sit after clicking Join that the user should hear about. */
 export type JoinWait = 'waiting-room' | 'waiting-for-host';
+
+export interface JoinResult {
+  /** Display names of the bots now in the meeting. */
+  joined: string[];
+  /** Bots that didn't get in: they failed, or never started once joining stopped. */
+  failed: number;
+  /** Why the first of them failed. */
+  failureReason?: string;
+}
 
 type JoinState =
   | JoinWait
@@ -43,6 +61,7 @@ type JoinState =
   | 'wrong-passcode'
   | 'sign-in-required'
   | 'unavailable'
+  | 'full'
   | 'pending';
 
 interface MeetingSession {
@@ -83,28 +102,40 @@ export class ZoomService implements OnModuleDestroy {
 
   /**
    * Open the Zoom web client in a headless browser and join the meeting with
-   * BOTS_PER_MEETING participants (muted, no video), each in its own browser
-   * context under a distinct random Indian name tagged as a bot. Resolves only
-   * once every bot is actually in the meeting. All or nothing: if any bot
-   * fails, the others are closed too.
+   * `botCount` participants (muted, no video), each in its own browser context
+   * under a distinct random Indian name tagged as a bot. Resolves once every
+   * bot is in the meeting or has given up.
+   *
+   * Problems with the meeting itself (needs a passcode, ended, signed-in users
+   * only) stop the whole join. A single bot failing only drops that bot; a
+   * full meeting, or MAX_FAILURES_IN_A_ROW failures, stops new bots starting.
    *
    * @param details passcode/email, for meetings whose join page asks for them
    * @param onWait called once per waiting state (e.g. the waiting room)
-   * @returns the display names the bots joined as
    * @throws JoinNeedsInputError when Zoom asks for a detail not in `details`
    */
   async join(
     link: ParsedZoomLink,
-    details: JoinDetails = {},
+    details: JoinDetails,
+    botCount: number,
     onWait?: (state: JoinWait) => void,
-  ): Promise<string[]> {
+  ): Promise<JoinResult> {
     const { meetingNumber } = link;
+    if (
+      !Number.isInteger(botCount) ||
+      botCount < 1 ||
+      botCount > MAX_BOTS_PER_MEETING
+    ) {
+      throw new RangeError(
+        `The number of bots must be from 1 to ${MAX_BOTS_PER_MEETING}; got ${botCount}.`,
+      );
+    }
     if (this.sessions.has(meetingNumber) || this.joining.has(meetingNumber)) {
       throw new Error(`Already in or joining meeting ${meetingNumber}.`);
     }
     this.joining.add(meetingNumber);
     try {
-      return await this.joinAll(link, details, onWait);
+      return await this.joinAll(link, details, botCount, onWait);
     } finally {
       this.joining.delete(meetingNumber);
     }
@@ -113,12 +144,16 @@ export class ZoomService implements OnModuleDestroy {
   private async joinAll(
     link: ParsedZoomLink,
     details: JoinDetails,
+    botCount: number,
     onWait?: (state: JoinWait) => void,
-  ): Promise<string[]> {
-    const displayNames = this.pickDisplayNames(BOTS_PER_MEETING);
+  ): Promise<JoinResult> {
+    const displayNames = this.pickDisplayNames(botCount);
     const browser = await this.launchBrowser();
+    // Loading the join page is the heavy part, so only a few bots do it at
+    // once; each frees its slot as soon as it has clicked Join.
+    const slots = new Slots(this.joinConcurrency());
 
-    // Both bots land in the same waiting room; tell the user once.
+    // The bots land in the same waiting room; tell the user once.
     const announced = new Set<JoinWait>();
     const announce = (state: JoinWait) => {
       if (!announced.has(state)) {
@@ -127,38 +162,79 @@ export class ZoomService implements OnModuleDestroy {
       }
     };
 
-    // On the first failure, close the browser so the other bot stops too
-    // rather than sitting in a waiting room for minutes.
-    let failure: unknown;
+    const joined: string[] = [];
+    let firstError: unknown;
+    let fatal = false; // the meeting won't take any bot: everyone leaves
+    let stopped = false; // no point starting more bots
+    let failuresInARow = 0;
+
     await Promise.all(
-      displayNames.map((name, i) =>
-        this.joinAs(browser, link, details, name, i + 1, announce).catch(
-          async (err) => {
-            if (failure === undefined) {
-              failure = err;
-              await browser.close().catch(() => undefined);
-            }
-          },
-        ),
-      ),
+      displayNames.map(async (name, i) => {
+        const release = await slots.acquire();
+        try {
+          if (stopped) {
+            return;
+          }
+          await this.joinAs(browser, link, details, name, i + 1, announce, () => {
+            failuresInARow = 0;
+            release();
+          });
+          joined.push(name);
+        } catch (err) {
+          if (fatal) {
+            return; // the browser was closed under this bot
+          }
+          firstError ??= err;
+          if (err instanceof JoinNeedsInputError || err instanceof MeetingClosedError) {
+            // Close the browser so the other bots stop too, rather than
+            // sitting in a waiting room for minutes.
+            fatal = stopped = true;
+            firstError = err;
+            await browser.close().catch(() => undefined);
+          } else if (
+            err instanceof MeetingFullError ||
+            ++failuresInARow >= MAX_FAILURES_IN_A_ROW
+          ) {
+            stopped = true;
+          }
+        } finally {
+          release();
+        }
+      }),
     );
-    if (failure !== undefined) {
-      throw failure;
+
+    if (fatal || joined.length === 0) {
+      await browser.close().catch(() => undefined);
+      throw firstError;
     }
 
     this.sessions.set(link.meetingNumber, {
       browser,
-      displayNames,
+      displayNames: joined,
       link,
       joinedAt: new Date(),
     });
     this.logger.log(
-      `Joined meeting ${link.meetingNumber} as ${displayNames.join(', ')}.`,
+      `Joined meeting ${link.meetingNumber} with ${joined.length} of ${botCount} bots.`,
     );
-    return displayNames;
+    const failed = botCount - joined.length;
+    return {
+      joined,
+      failed,
+      failureReason:
+        failed > 0
+          ? firstError instanceof Error
+            ? firstError.message
+            : String(firstError)
+          : undefined,
+    };
   }
 
-  /** Join one bot in its own browser context, so Zoom sees a separate client. */
+  /**
+   * Join one bot in its own browser context, so Zoom sees a separate client.
+   * Calls `joinClicked` once it has clicked Join; on failure the bot's context
+   * is closed, leaving the other bots in place.
+   */
   private async joinAs(
     browser: Browser,
     link: ParsedZoomLink,
@@ -166,6 +242,7 @@ export class ZoomService implements OnModuleDestroy {
     displayName: string,
     botNumber: number,
     onWait: (state: JoinWait) => void,
+    joinClicked: () => void,
   ): Promise<void> {
     const stepTimeout = Number(
       this.config.get<string>('ZOOM_STEP_TIMEOUT_MS', '45000'),
@@ -222,19 +299,30 @@ export class ZoomService implements OnModuleDestroy {
       if (!joinOk) {
         throw new Error('Could not find or click the Join button.');
       }
+      joinClicked();
 
       await this.waitUntilAdmitted(page, onWait);
       await this.handlePostJoin(page);
     } catch (err) {
-      // A missing detail isn't a page problem, and once the browser is closed
-      // (another bot already failed) there's no page to screenshot.
-      if (err instanceof JoinNeedsInputError || !browser.connected) {
+      // Problems with the meeting aren't page problems, and once the browser
+      // is closed (the whole join stopped) there's no page to screenshot.
+      if (
+        err instanceof JoinNeedsInputError ||
+        err instanceof MeetingClosedError ||
+        !browser.connected
+      ) {
         throw err;
       }
-      await this.captureDebugScreenshot(
-        page,
-        `${link.meetingNumber}-bot${botNumber}`,
-      );
+      if (!(err instanceof MeetingFullError)) {
+        await this.captureDebugScreenshot(
+          page,
+          `${link.meetingNumber}-bot${botNumber}`,
+        );
+      }
+      await context.close().catch(() => undefined);
+      if (err instanceof MeetingFullError) {
+        throw err;
+      }
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`Bot ${botNumber} ("${displayName}"): ${message}`);
     }
@@ -454,6 +542,9 @@ export class ZoomService implements OnModuleDestroy {
         if (/meeting has (been )?ended|invalid meeting|meeting id is not valid|not a valid meeting|removed you from/i.test(text)) {
           return 'unavailable';
         }
+        if (/meeting is full|reached (its|the) (maximum|participant limit|capacity)|maximum number of participants/i.test(text)) {
+          return 'full';
+        }
         if (/host will let you in|waiting room/i.test(text)) {
           return 'waiting-room';
         }
@@ -469,13 +560,24 @@ export class ZoomService implements OnModuleDestroy {
 
   private failIfBlocked(state: JoinState): void {
     if (state === 'sign-in-required') {
-      throw new Error(
+      throw new MeetingClosedError(
         "This meeting only admits signed-in Zoom users, so the bots can't join it as guests.",
       );
     }
     if (state === 'unavailable') {
-      throw new Error('Zoom says this meeting has ended or the link is invalid.');
+      throw new MeetingClosedError(
+        'Zoom says this meeting has ended or the link is invalid.',
+      );
     }
+    if (state === 'full') {
+      throw new MeetingFullError('Zoom says the meeting is full.');
+    }
+  }
+
+  /** How many bots may load the join page at the same time. */
+  private joinConcurrency(): number {
+    const value = Number(this.config.get<string>('ZOOM_JOIN_CONCURRENCY', '5'));
+    return Number.isInteger(value) && value > 0 ? value : 5;
   }
 
   private async clickJoin(page: Page): Promise<boolean> {
@@ -568,5 +670,34 @@ export class ZoomService implements OnModuleDestroy {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+/** Lets at most `free` holders run at once; the rest wait their turn in order. */
+class Slots {
+  private readonly waiting: (() => void)[] = [];
+
+  constructor(private free: number) {}
+
+  /** Waits for a slot. The returned function frees it; extra calls are no-ops. */
+  async acquire(): Promise<() => void> {
+    if (this.free > 0) {
+      this.free--;
+    } else {
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    }
+    let held = true;
+    return () => {
+      if (!held) {
+        return;
+      }
+      held = false;
+      const next = this.waiting.shift();
+      if (next) {
+        next(); // hand the slot straight over
+      } else {
+        this.free++;
+      }
+    };
   }
 }

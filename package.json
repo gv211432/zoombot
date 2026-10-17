@@ -1,7 +1,7 @@
 {
   "name": "zoombot",
   "version": "0.1.0",
-  "description": "A Telegram bot that makes a single headless browser client join a Zoom meeting from a shared link.",
+  "description": "A Telegram bot that makes headless browser clients join a Zoom meeting from a shared link.",
   "private": true,
   "scripts": {
     "build": "nest build",
