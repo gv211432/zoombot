@@ -11,6 +11,7 @@ import { ZoomModule } from './zoom/zoom.module';
     ConfigModule.forRoot({ isGlobal: true }),
 
     // Telegram bot in long-polling mode — no public URL / webhook needed.
+    // TelegramPolling starts the polling, so it can survive a 409 on redeploy.
     TelegrafModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -21,7 +22,7 @@ import { ZoomModule } from './zoom/zoom.module';
             'TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env and fill it in.',
           );
         }
-        return { token };
+        return { token, launchOptions: false };
       },
     }),
 
