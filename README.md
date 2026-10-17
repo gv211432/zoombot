@@ -18,8 +18,9 @@ Service**, and it is inherently fragile:
 
 - Zoom changes its web-client HTML without notice. When a join starts failing,
   the CSS selectors in `src/zoom/zoom.service.ts` (or the `ZOOM_SEL_*` env
-  overrides) will need updating. The bot saves a screenshot to
-  `./debug-screenshots/` on failure to help with this.
+  overrides) will need updating. On failure the bot sends a screenshot of what
+  Zoom showed to the Telegram chat (and keeps the newest 20 in
+  `./debug-screenshots/`) to help with this.
 - Only use it on meetings **you host or are authorised to join**, and keep the
   "(bot)" tag on display names so participants know bots are present.
   Many jurisdictions require consent to record/transcribe a meeting.
@@ -62,6 +63,23 @@ bun run start:prod   # or: node dist/main.js
 The process exposes `GET /health` (port from `HEALTH_PORT`, default 3000) and
 polls Telegram for messages — no public URL/webhook required.
 
+### Deploying on Railway
+
+`railway.json` builds with `bun run build` and starts `bun run start:prod`;
+Railpack installs Chromium's system libraries because Puppeteer is a
+dependency. Telegram allows one poller per bot token, so while a redeploy
+overlaps the old and new containers one of them gets a `409 Conflict`; the bot
+logs it and polls again 10s later instead of crashing. If the 409 warning
+keeps repeating, something else is running with the same token (a local
+`bun run start:dev`, or another service) — stop it or give it its own token.
+
+### Freeing memory
+
+Every bot is a Chromium tab holding a few hundred MB. Every 30s the bot checks
+on them: a bot whose meeting ended or who was removed by the host has its tab
+closed, and once a meeting has no bots left its browser is shut and you get a
+👋 message in Telegram. Leaving (button or `/leave`) closes the whole browser.
+
 ## Usage (in Telegram)
 
 | Action | What happens |
@@ -71,7 +89,8 @@ polls Telegram for messages — no public URL/webhook required.
 | Paste a Zoom link | The bot asks how many bots to send: tap a quick pick or type any number from 1 to 500. They join under names like "Arnab Chatterjee (bot)" |
 | Reply to a 🔒 question | If the link has no passcode (or Zoom rejects it), the bot asks for it and retries |
 | `/cancel` | Drops a join that is waiting for your reply |
-| `/status` | Lists the meetings the bot is currently in |
+| `/status` | Lists the meetings the bot is in (or joining), each with a 🚪 Leave button |
+| 🚪 Leave button | On join messages and `/status`: the bots leave that meeting, or stop joining it |
 | `/leave [meetingNumber]` | Leaves one meeting, or all meetings if omitted |
 | `/whoami` | Shows your Telegram user id (for the allow-list) |
 
@@ -91,6 +110,16 @@ most plans by default), and bots count toward that cap.
   reply says how many got in and why the others didn't.
 - New bots stop starting once Zoom says the meeting is full, or after 3 bots
   fail in a row.
+
+### "This meeting only admits signed-in Zoom users"
+
+The bots join as guests through Zoom's web client. If the host's account has
+**Only authenticated users can join meetings** or **Only authenticated users can
+join meetings from Web client** turned on (Zoom web portal → Settings → Meeting →
+Security), Zoom asks for a sign-in and the bots can't get in. The host has to
+turn those off (an account admin may have locked them); the bot does not sign
+in to Zoom accounts. If the meeting hasn't started yet, Zoom may only show the
+sign-in prompt once the host starts it.
 
 Supported link shapes: `https://…zoom.us/j/{id}?pwd=…`, `/wc/join/{id}`,
 `/wc/{id}/join`, `/s/{id}`, `/w/{id}`. Personal-link (`…/my/alias`) and

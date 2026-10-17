@@ -4,7 +4,9 @@ import { Action, Command, Ctx, Help, On, Start, Update } from 'nestjs-telegraf';
 import { Context, Markup } from 'telegraf';
 import { AuthService, LOCKOUT_MS, SESSION_IDLE_MS } from '../auth/auth.service';
 import {
+  JoinCancelledError,
   JoinDetails,
+  JoinFailedError,
   JoinNeed,
   JoinNeedsInputError,
   JoinWait,
@@ -53,6 +55,13 @@ function parseBotCount(value: string): number | undefined {
   return count >= 1 && count <= MAX_BOTS_PER_MEETING ? count : undefined;
 }
 
+/** A button that makes the bots leave one meeting (or stop joining it). */
+const leaveButton = (meetingNumber: string) =>
+  Markup.button.callback(`🚪 Leave ${meetingNumber}`, `leave:${meetingNumber}`);
+
+const leaveKeyboard = (meetingNumber: string) =>
+  Markup.inlineKeyboard([leaveButton(meetingNumber)]);
+
 /** Every name for a few bots; a sample for many, to fit a Telegram message. */
 function botList(names: string[]): string {
   return names.length <= 5
@@ -96,8 +105,9 @@ export class TelegramUpdate {
         '• Just paste a Zoom link (or the whole invitation); I will ask how many bots',
         '• If the meeting needs a passcode, I will ask for it',
         '• /cancel — drop a join that is waiting for your reply',
-        '• /status — which meetings I am currently in',
+        '• /status — which meetings I am in, with a 🚪 Leave button for each',
         '• /leave [meetingNumber] — leave one meeting, or all if omitted',
+        '• 🚪 Leave buttons also appear on join messages, and stop a join in progress',
         '• /whoami — show your Telegram user id',
         `• /logout — end your session now (it also ends after ${minutes(SESSION_IDLE_MS)} idle minutes)`,
       ].join('\n'),
@@ -165,11 +175,19 @@ export class TelegramUpdate {
       await ctx.reply('Not in any meetings right now.');
       return;
     }
+    const describe = (n: string) => {
+      const names = this.zoom.displayNamesIn(n);
+      return this.zoom.isJoining(n)
+        ? `• ${n}: joining, ${names.length} in so far`
+        : `• ${n}: ${botList(names)}`;
+    };
+    const buttons = active.map((n) => [leaveButton(n)]);
+    if (active.length > 1) {
+      buttons.push([Markup.button.callback('🚪 Leave all', 'leave:all')]);
+    }
     await ctx.reply(
-      [
-        `Currently in ${active.length} meeting(s):`,
-        ...active.map((n) => `• ${n}: ${botList(this.zoom.displayNamesIn(n))}`),
-      ].join('\n'),
+      [`Currently in ${active.length} meeting(s):`, ...active.map(describe)].join('\n'),
+      Markup.inlineKeyboard(buttons),
     );
   }
 
@@ -252,7 +270,10 @@ export class TelegramUpdate {
 
     this.pending.delete(chatId); // a new link replaces any unanswered question
     if (this.zoom.isInMeeting(link.meetingNumber)) {
-      await ctx.reply(`I'm already in meeting ${link.meetingNumber}.`);
+      await ctx.reply(
+        `I'm already in (or joining) meeting ${link.meetingNumber}.`,
+        leaveKeyboard(link.meetingNumber),
+      );
       return;
     }
 
@@ -310,28 +331,39 @@ export class TelegramUpdate {
     botCount: number,
   ): Promise<void> {
     const meeting = link.meetingNumber;
-    const say = (message: string) =>
+    const warn = (e: unknown) =>
+      this.logger.warn(`Could not send Telegram reply: ${e}`);
+    const say = (message: string, withLeaveButton = false) =>
       ctx
-        .reply(message)
-        .catch((e) => this.logger.warn(`Could not send Telegram reply: ${e}`));
+        .reply(message, withLeaveButton ? leaveKeyboard(meeting) : undefined)
+        .catch(warn);
+    // On Railway the screenshot on disk is out of reach, so send it here.
+    const showScreenshot = (image: Buffer | undefined) =>
+      image &&
+      ctx
+        .replyWithPhoto({ source: image }, { caption: 'What Zoom showed the bot' })
+        .catch(warn);
 
-    await say(`Joining meeting ${meeting} with ${botCount} bot(s)…`);
+    await say(`Joining meeting ${meeting} with ${botCount} bot(s)…`, true);
     try {
-      const { joined, failed, failureReason } = await this.zoom.join(
-        link,
-        details,
-        botCount,
-        (state) => {
-          void say(WAIT_MESSAGES[state]);
-        },
-      );
+      const { joined, failed, failureReason, failureScreenshot } =
+        await this.zoom.join(link, details, botCount, {
+          onWait: (state) => void say(WAIT_MESSAGES[state]),
+          onEnded: (reason) =>
+            void say(`👋 The bots left meeting ${meeting}: ${reason}.`),
+        });
       await say(
         failed === 0
           ? `✅ Joined meeting ${meeting} with ${joined.length} bot(s): ${botList(joined)}.`
           : `⚠️ Only ${joined.length} of ${botCount} bots got into meeting ${meeting}: ` +
               `${botList(joined)}.\nThe other ${failed} didn't: ${failureReason}`,
+        true,
       );
+      await showScreenshot(failureScreenshot);
     } catch (err) {
+      if (err instanceof JoinCancelledError) {
+        return; // the Leave handler already replied
+      }
       if (err instanceof JoinNeedsInputError && ctx.chat) {
         this.pending.set(ctx.chat.id, { need: err.need, link, details, botCount });
         await say(`🔒 ${err.message} ${ASK_FOR[err.need]}, or /cancel.`);
@@ -340,7 +372,30 @@ export class TelegramUpdate {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`Failed to join ${meeting}: ${message}`);
       await say(`❌ Couldn't join meeting ${meeting}.\nReason: ${message}`);
+      if (err instanceof JoinFailedError) {
+        await showScreenshot(err.screenshot);
+      }
     }
+  }
+
+  /** A tap on a "Leave" button: the bots leave that meeting (or all of them). */
+  @Action(/^leave:/)
+  async onLeaveTapped(@Ctx() ctx: Context): Promise<void> {
+    await ctx.answerCbQuery().catch(() => undefined); // stop the button's spinner
+    if (!(await this.guard(ctx))) return;
+
+    const data =
+      ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
+    const target = data.slice('leave:'.length);
+    if (target === 'all') {
+      const count = await this.zoom.leaveAll();
+      await ctx.reply(count > 0 ? `👋 Left ${count} meeting(s).` : 'No meetings to leave.');
+      return;
+    }
+    const left = await this.zoom.leave(target);
+    await ctx.reply(
+      left ? `👋 The bots left meeting ${target}.` : `I am not in meeting ${target}.`,
+    );
   }
 
   // ─── helpers ──────────────────────────────────────────────────────────────
