@@ -66,6 +66,8 @@ polls Telegram for messages — no public URL/webhook required.
 | Action | What happens |
 | --- | --- |
 | Paste a Zoom link | Two bots join that meeting, e.g. "Arnab Chatterjee (bot)" and "Jasleen Sandhu (bot)" |
+| Reply to a 🔒 question | If the link has no passcode (or Zoom rejects it), the bot asks for it and retries |
+| `/cancel` | Drops a join that is waiting for your reply |
 | `/status` | Lists the meetings the bot is currently in |
 | `/leave [meetingNumber]` | Leaves one meeting, or all meetings if omitted |
 | `/whoami` | Shows your Telegram user id (for the allow-list) |

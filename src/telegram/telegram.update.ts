@@ -2,13 +2,44 @@ import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Command, Ctx, Help, On, Start, Update } from 'nestjs-telegraf';
 import { Context } from 'telegraf';
-import { ZoomService } from '../zoom/zoom.service';
-import { extractZoomUrl, parseZoomLink } from '../zoom/zoom-url.util';
+import {
+  JoinDetails,
+  JoinNeed,
+  JoinNeedsInputError,
+  JoinWait,
+  ZoomService,
+} from '../zoom/zoom.service';
+import {
+  extractZoomUrl,
+  ParsedZoomLink,
+  parseZoomLink,
+} from '../zoom/zoom-url.util';
+
+/** A join paused until the user replies with the detail Zoom asked for. */
+interface PendingJoin {
+  link: ParsedZoomLink;
+  details: JoinDetails;
+  need: JoinNeed;
+}
+
+const ASK_FOR: Record<JoinNeed, string> = {
+  passcode: 'Reply with the meeting passcode',
+  email: 'Reply with the email address the bots should use',
+};
+
+const WAIT_MESSAGES: Record<JoinWait, string> = {
+  'waiting-room':
+    '⏳ The bots are in the waiting room — admit them from the Participants list.',
+  'waiting-for-host':
+    "⏳ The meeting hasn't started yet. The bots will join once the host starts it.",
+};
 
 @Update()
 export class TelegramUpdate {
   private readonly logger = new Logger(TelegramUpdate.name);
   private readonly allowedUserIds: Set<number>;
+  /** Per chat: a join waiting on the user's reply. */
+  private readonly pending = new Map<number, PendingJoin>();
 
   constructor(
     private readonly zoom: ZoomService,
@@ -35,7 +66,9 @@ export class TelegramUpdate {
         'room knows bots are present.',
         '',
         'Commands:',
-        '• Just paste a Zoom link to join it',
+        '• Just paste a Zoom link (or the whole invitation) to join it',
+        '• If the meeting needs a passcode, I will ask for it',
+        '• /cancel — drop a join that is waiting for your reply',
         '• /status — which meetings I am currently in',
         '• /leave [meetingNumber] — leave one meeting, or all if omitted',
         '• /whoami — show your Telegram user id',
@@ -84,15 +117,39 @@ export class TelegramUpdate {
     await ctx.reply(count > 0 ? `Left ${count} meeting(s).` : 'No meetings to leave.');
   }
 
+  @Command('cancel')
+  async onCancel(@Ctx() ctx: Context): Promise<void> {
+    if (!(await this.guard(ctx))) return;
+    const cancelled = ctx.chat !== undefined && this.pending.delete(ctx.chat.id);
+    await ctx.reply(cancelled ? 'OK, cancelled that join.' : 'Nothing to cancel.');
+  }
+
   @On('text')
   async onText(@Ctx() ctx: Context): Promise<void> {
     if (!(await this.guard(ctx))) return;
 
     const text =
       ctx.message && 'text' in ctx.message ? ctx.message.text : undefined;
-    if (!text) return;
+    const chatId = ctx.chat?.id;
+    if (!text || chatId === undefined) return;
 
     const url = extractZoomUrl(text);
+    const pending = this.pending.get(chatId);
+    if (!url && pending) {
+      // The answer to the detail we asked for: retry the join with it.
+      const value = text.trim();
+      if (pending.need === 'email' && !/^\S+@\S+\.\S+$/.test(value)) {
+        await ctx.reply("That doesn't look like an email address. Try again, or /cancel.");
+        return;
+      }
+      this.pending.delete(chatId);
+      void this.runJoin(ctx, pending.link, {
+        ...pending.details,
+        [pending.need]: value,
+      });
+      return;
+    }
+
     if (!url) {
       await ctx.reply(
         "That doesn't look like a Zoom link. Paste a link like https://…zoom.us/j/1234567890?pwd=…",
@@ -110,23 +167,47 @@ export class TelegramUpdate {
       return;
     }
 
+    this.pending.delete(chatId); // a new link replaces any unanswered question
     if (this.zoom.isInMeeting(link.meetingNumber)) {
       await ctx.reply(`I'm already in meeting ${link.meetingNumber}.`);
       return;
     }
 
-    await ctx.reply(`Joining meeting ${link.meetingNumber}…`);
+    // A pasted Zoom invitation often includes "Passcode: abc123" as text.
+    const passcode = text.match(/\bpasscode\s*:\s*(\S+)/i)?.[1];
+    void this.runJoin(ctx, link, { passcode });
+  }
+
+  /**
+   * Join and report back in the chat. Callers don't await this: waiting to be
+   * admitted can take minutes, longer than Telegraf's 90s handler timeout.
+   */
+  private async runJoin(
+    ctx: Context,
+    link: ParsedZoomLink,
+    details: JoinDetails,
+  ): Promise<void> {
+    const meeting = link.meetingNumber;
+    const say = (message: string) =>
+      ctx
+        .reply(message)
+        .catch((e) => this.logger.warn(`Could not send Telegram reply: ${e}`));
+
+    await say(`Joining meeting ${meeting}…`);
     try {
-      const names = await this.zoom.join(link);
-      await ctx.reply(
-        `✅ Joined meeting ${link.meetingNumber} as ${names.join(' and ')}.`,
-      );
+      const names = await this.zoom.join(link, details, (state) => {
+        void say(WAIT_MESSAGES[state]);
+      });
+      await say(`✅ Joined meeting ${meeting} as ${names.join(' and ')}.`);
     } catch (err) {
+      if (err instanceof JoinNeedsInputError && ctx.chat) {
+        this.pending.set(ctx.chat.id, { link, details, need: err.need });
+        await say(`🔒 ${err.message} ${ASK_FOR[err.need]}, or /cancel.`);
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(`Failed to join ${link.meetingNumber}: ${message}`);
-      await ctx.reply(
-        `❌ Couldn't join meeting ${link.meetingNumber}.\nReason: ${message}`,
-      );
+      this.logger.error(`Failed to join ${meeting}: ${message}`);
+      await say(`❌ Couldn't join meeting ${meeting}.\nReason: ${message}`);
     }
   }
 

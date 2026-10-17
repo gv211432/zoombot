@@ -82,12 +82,12 @@ function buildWebClientUrl(
   meetingNumber: string,
   password?: string,
 ): string {
-  const target = new URL(`https://${host}/wc/join/${meetingNumber}`);
+  // Zoom redirects this to app.zoom.us/wc/{mn}/join, the web client's
+  // name-and-join preview. Don't add fromPWA=1: it now bounces to the Zoom
+  // Workplace sign-in landing page instead.
+  const target = new URL(`https://${host}/wc/${meetingNumber}/join`);
   if (password) {
     target.searchParams.set('pwd', password);
   }
-  // Hint Zoom to keep us in the in-browser client rather than bouncing to the
-  // desktop-app launcher.
-  target.searchParams.set('fromPWA', '1');
   return target.toString();
 }

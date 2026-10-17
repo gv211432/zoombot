@@ -16,6 +16,35 @@ const BOTS_PER_MEETING = 2;
 /** Appended to every generated name so the room can tell the bots from people. */
 const BOT_NAME_TAG = ' (bot)';
 
+/** Details only some meetings ask for; the user supplies them on request. */
+export interface JoinDetails {
+  passcode?: string;
+  email?: string;
+}
+
+export type JoinNeed = keyof JoinDetails;
+
+/** Zoom asked for a detail we don't have: ask the user, then join again. */
+export class JoinNeedsInputError extends Error {
+  constructor(
+    readonly need: JoinNeed,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Places a bot can sit after clicking Join that the user should hear about. */
+export type JoinWait = 'waiting-room' | 'waiting-for-host';
+
+type JoinState =
+  | JoinWait
+  | 'in-meeting'
+  | 'wrong-passcode'
+  | 'sign-in-required'
+  | 'unavailable'
+  | 'pending';
+
 interface MeetingSession {
   browser: Browser;
   displayNames: string[];
@@ -27,6 +56,8 @@ interface MeetingSession {
 export class ZoomService implements OnModuleDestroy {
   private readonly logger = new Logger(ZoomService.name);
   private readonly sessions = new Map<string, MeetingSession>();
+  /** Meetings with a join in progress, which can take minutes in a waiting room. */
+  private readonly joining = new Set<string>();
 
   constructor(
     private readonly config: ConfigService,
@@ -53,30 +84,66 @@ export class ZoomService implements OnModuleDestroy {
   /**
    * Open the Zoom web client in a headless browser and join the meeting with
    * BOTS_PER_MEETING participants (muted, no video), each in its own browser
-   * context under a distinct random Indian name tagged as a bot. All or
-   * nothing: if any bot fails to join, the others are closed too.
+   * context under a distinct random Indian name tagged as a bot. Resolves only
+   * once every bot is actually in the meeting. All or nothing: if any bot
+   * fails, the others are closed too.
    *
+   * @param details passcode/email, for meetings whose join page asks for them
+   * @param onWait called once per waiting state (e.g. the waiting room)
    * @returns the display names the bots joined as
+   * @throws JoinNeedsInputError when Zoom asks for a detail not in `details`
    */
-  async join(link: ParsedZoomLink): Promise<string[]> {
-    if (this.sessions.has(link.meetingNumber)) {
-      throw new Error(`Already in meeting ${link.meetingNumber}.`);
+  async join(
+    link: ParsedZoomLink,
+    details: JoinDetails = {},
+    onWait?: (state: JoinWait) => void,
+  ): Promise<string[]> {
+    const { meetingNumber } = link;
+    if (this.sessions.has(meetingNumber) || this.joining.has(meetingNumber)) {
+      throw new Error(`Already in or joining meeting ${meetingNumber}.`);
     }
+    this.joining.add(meetingNumber);
+    try {
+      return await this.joinAll(link, details, onWait);
+    } finally {
+      this.joining.delete(meetingNumber);
+    }
+  }
 
+  private async joinAll(
+    link: ParsedZoomLink,
+    details: JoinDetails,
+    onWait?: (state: JoinWait) => void,
+  ): Promise<string[]> {
     const displayNames = this.pickDisplayNames(BOTS_PER_MEETING);
     const browser = await this.launchBrowser();
 
-    // Join concurrently, but let every bot settle before closing the browser
-    // so one bot's failure doesn't pull pages out from under another mid-join.
-    const results = await Promise.allSettled(
-      displayNames.map((name, i) => this.joinAs(browser, link, name, i + 1)),
+    // Both bots land in the same waiting room; tell the user once.
+    const announced = new Set<JoinWait>();
+    const announce = (state: JoinWait) => {
+      if (!announced.has(state)) {
+        announced.add(state);
+        onWait?.(state);
+      }
+    };
+
+    // On the first failure, close the browser so the other bot stops too
+    // rather than sitting in a waiting room for minutes.
+    let failure: unknown;
+    await Promise.all(
+      displayNames.map((name, i) =>
+        this.joinAs(browser, link, details, name, i + 1, announce).catch(
+          async (err) => {
+            if (failure === undefined) {
+              failure = err;
+              await browser.close().catch(() => undefined);
+            }
+          },
+        ),
+      ),
     );
-    const failure = results.find(
-      (r): r is PromiseRejectedResult => r.status === 'rejected',
-    );
-    if (failure) {
-      await browser.close().catch(() => undefined);
-      throw failure.reason;
+    if (failure !== undefined) {
+      throw failure;
     }
 
     this.sessions.set(link.meetingNumber, {
@@ -95,8 +162,10 @@ export class ZoomService implements OnModuleDestroy {
   private async joinAs(
     browser: Browser,
     link: ParsedZoomLink,
+    details: JoinDetails,
     displayName: string,
     botNumber: number,
+    onWait: (state: JoinWait) => void,
   ): Promise<void> {
     const stepTimeout = Number(
       this.config.get<string>('ZOOM_STEP_TIMEOUT_MS', '45000'),
@@ -128,18 +197,40 @@ export class ZoomService implements OnModuleDestroy {
         stepTimeout,
       );
       if (!nameOk) {
+        this.failIfBlocked(await this.readJoinState(page));
         throw new Error('Could not find the display-name input on the join page.');
       }
 
-      await this.maybeTypePasscode(page, link.password);
+      // Shown only when the link doesn't carry the passcode (no ?pwd=), and on
+      // webinars that collect an email.
+      await this.fillIfShown(
+        page,
+        this.passcodeSelectors(),
+        details.passcode,
+        'passcode',
+        'This meeting needs a passcode.',
+      );
+      await this.fillIfShown(
+        page,
+        this.emailSelectors(),
+        details.email,
+        'email',
+        'This meeting asks for an email address (usually a webinar).',
+      );
 
       const joinOk = await this.clickJoin(page);
       if (!joinOk) {
         throw new Error('Could not find or click the Join button.');
       }
 
+      await this.waitUntilAdmitted(page, onWait);
       await this.handlePostJoin(page);
     } catch (err) {
+      // A missing detail isn't a page problem, and once the browser is closed
+      // (another bot already failed) there's no page to screenshot.
+      if (err instanceof JoinNeedsInputError || !browser.connected) {
+        throw err;
+      }
       await this.captureDebugScreenshot(
         page,
         `${link.meetingNumber}-bot${botNumber}`,
@@ -226,6 +317,15 @@ export class ZoomService implements OnModuleDestroy {
     ]);
   }
 
+  private emailSelectors(): string[] {
+    return this.selectorsFromEnv('ZOOM_SEL_EMAIL_INPUT', [
+      '#input-for-email',
+      'input[type="email"]',
+      'input[aria-label*="email" i]',
+      'input[placeholder*="email" i]',
+    ]);
+  }
+
   private joinSelectors(): string[] {
     return this.selectorsFromEnv('ZOOM_SEL_JOIN_BUTTON', [
       'button.preview-join-button',
@@ -273,21 +373,108 @@ export class ZoomService implements OnModuleDestroy {
     return false;
   }
 
-  private async maybeTypePasscode(
+  /**
+   * Fill a field the join page shows only for some meetings. If it's showing
+   * and we don't have the value, stop so the user can be asked for it.
+   */
+  private async fillIfShown(
     page: Page,
-    password?: string,
+    selectors: string[],
+    value: string | undefined,
+    need: JoinNeed,
+    missingMessage: string,
   ): Promise<void> {
-    if (!password) {
-      return;
-    }
-    // The passcode field only appears when the pwd wasn't accepted from the URL.
-    for (const selector of this.passcodeSelectors()) {
-      const el = await page.$(selector);
-      if (el) {
-        await el.type(password, { delay: 20 });
-        this.logger.log('Entered meeting passcode.');
+    for (const selector of selectors) {
+      const field = await page.$(selector);
+      if (field && (await field.isVisible())) {
+        if (!value) {
+          throw new JoinNeedsInputError(need, missingMessage);
+        }
+        await field.click({ clickCount: 3 });
+        await field.type(value, { delay: 20 });
         return;
       }
+    }
+  }
+
+  /**
+   * After clicking Join, wait until the bot is really in the meeting,
+   * reporting waiting rooms on the way and failing fast on dead ends.
+   */
+  private async waitUntilAdmitted(
+    page: Page,
+    onWait: (state: JoinWait) => void,
+  ): Promise<void> {
+    const timeout = Number(
+      this.config.get<string>('ZOOM_ADMIT_TIMEOUT_MS', '300000'),
+    );
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const state = await this.readJoinState(page);
+      if (state === 'in-meeting') {
+        return;
+      }
+      if (state === 'wrong-passcode') {
+        throw new JoinNeedsInputError('passcode', 'Zoom rejected that passcode.');
+      }
+      this.failIfBlocked(state);
+      if (state === 'waiting-room' || state === 'waiting-for-host') {
+        onWait(state);
+      }
+      await this.sleep(1000);
+    }
+    throw new Error(
+      `Still not in the meeting after ${Math.round(timeout / 1000)}s ` +
+        '(was it admitted from the waiting room?).',
+    );
+  }
+
+  /**
+   * Classify what the web client shows. "In the meeting" is the Leave button
+   * in the meeting controls; the rest comes from Zoom's on-screen messages.
+   */
+  private async readJoinState(page: Page): Promise<JoinState> {
+    try {
+      return await page.evaluate((): JoinState => {
+        const inMeeting = Array.from(document.querySelectorAll('button')).some(
+          (b) =>
+            (b.offsetWidth > 0 || b.offsetHeight > 0) &&
+            /^leave$/i.test((b.getAttribute('aria-label') || b.textContent || '').trim()),
+        );
+        if (inMeeting) {
+          return 'in-meeting';
+        }
+        const text = document.body.innerText;
+        if (/incorrect (password|passcode)|(password|passcode) (is )?(wrong|incorrect)/i.test(text)) {
+          return 'wrong-passcode';
+        }
+        if (/sign in to join|authorized attendees only|only authenticated users/i.test(text)) {
+          return 'sign-in-required';
+        }
+        if (/meeting has (been )?ended|invalid meeting|meeting id is not valid|not a valid meeting|removed you from/i.test(text)) {
+          return 'unavailable';
+        }
+        if (/host will let you in|waiting room/i.test(text)) {
+          return 'waiting-room';
+        }
+        if (/waiting for (the )?host to start/i.test(text)) {
+          return 'waiting-for-host';
+        }
+        return 'pending';
+      });
+    } catch {
+      return 'pending'; // the page was mid-navigation
+    }
+  }
+
+  private failIfBlocked(state: JoinState): void {
+    if (state === 'sign-in-required') {
+      throw new Error(
+        "This meeting only admits signed-in Zoom users, so the bots can't join it as guests.",
+      );
+    }
+    if (state === 'unavailable') {
+      throw new Error('Zoom says this meeting has ended or the link is invalid.');
     }
   }
 
