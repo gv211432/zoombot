@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TelegrafModule } from 'nestjs-telegraf';
 import { HealthController } from './health.controller';
+import { NameGeneratorModule } from './name-generator/name-generator.module';
 import { TelegramModule } from './telegram/telegram.module';
 import { ZoomModule } from './zoom/zoom.module';
 
@@ -26,6 +27,7 @@ import { ZoomModule } from './zoom/zoom.module';
 
     ZoomModule,
     TelegramModule,
+    NameGeneratorModule,
   ],
   controllers: [HealthController],
 })

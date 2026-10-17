@@ -87,6 +87,10 @@ src/
 ├── main.ts                  # bootstrap (HTTP health + Telegraf polling)
 ├── app.module.ts            # wires ConfigModule, TelegrafModule, modules
 ├── health.controller.ts     # GET /health
+├── name-generator/
+│   ├── name-generator.module.ts
+│   ├── name-generator.service.ts  # deterministic id → Indian name
+│   └── names/               # first/last name lists, one file per religion
 ├── telegram/
 │   ├── telegram.module.ts
 │   └── telegram.update.ts   # Telegram commands + link handling
@@ -95,6 +99,22 @@ src/
     ├── zoom.service.ts       # Puppeteer: open web client + join
     └── zoom-url.util.ts      # parse Zoom links → web-client join URL
 ```
+
+## Name generator
+
+`NameGeneratorModule` turns a numeric id into a stable Indian name. It holds
+1,000 first and 1,000 last names split across eight religions — Hindu (600),
+Muslim (160), Christian (75), Sikh (55), Buddhist, Jain, Zoroastrian (30 each)
+and Jewish (20) — covering castes, regions and occupational surnames.
+
+```ts
+generateName(42);              // any of the 1,000,000 first × last pairings
+generateName(42, 'sikh');      // both names drawn from the Sikh lists
+maxNameId('sikh');             // 3025 (55 × 55) — valid ids are 1..maxNameId()
+```
+
+The same id always returns the same name, but editing or reordering the lists
+in `src/name-generator/names/` reassigns names.
 
 ## Configuration reference
 
