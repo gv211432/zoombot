@@ -1,12 +1,14 @@
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Command, Ctx, Help, On, Start, Update } from 'nestjs-telegraf';
-import { Context } from 'telegraf';
+import { Action, Command, Ctx, Help, On, Start, Update } from 'nestjs-telegraf';
+import { Context, Markup } from 'telegraf';
+import { AuthService, LOCKOUT_MS, SESSION_IDLE_MS } from '../auth/auth.service';
 import {
   JoinDetails,
   JoinNeed,
   JoinNeedsInputError,
   JoinWait,
+  MAX_BOTS_PER_MEETING,
   ZoomService,
 } from '../zoom/zoom.service';
 import {
@@ -15,12 +17,16 @@ import {
   parseZoomLink,
 } from '../zoom/zoom-url.util';
 
-/** A join paused until the user replies with the detail Zoom asked for. */
-interface PendingJoin {
-  link: ParsedZoomLink;
-  details: JoinDetails;
-  need: JoinNeed;
-}
+/**
+ * A join paused until the user replies: first with how many bots to send,
+ * then with any detail Zoom asks for.
+ */
+type PendingJoin =
+  | { need: 'count'; link: ParsedZoomLink; details: JoinDetails }
+  | { need: JoinNeed; link: ParsedZoomLink; details: JoinDetails; botCount: number };
+
+/** Quick picks offered as buttons; any other number in range can be typed. */
+const BOT_COUNT_CHOICES = [1, 2, 3, 5, 10, 25, 50, 100, 250, 500];
 
 const ASK_FOR: Record<JoinNeed, string> = {
   passcode: 'Reply with the meeting passcode',
@@ -34,6 +40,26 @@ const WAIT_MESSAGES: Record<JoinWait, string> = {
     "⏳ The meeting hasn't started yet. The bots will join once the host starts it.",
 };
 
+const LOGIN_PROMPT = 'Send /login <password> to start a session.';
+
+const minutes = (ms: number) => Math.ceil(ms / 60_000);
+
+const lockedMessage = (ms: number) =>
+  `⛔ Too many wrong passwords. Try again in ${minutes(ms)} minute(s).`;
+
+/** A whole number of bots in the allowed range, or undefined. */
+function parseBotCount(value: string): number | undefined {
+  const count = /^\d+$/.test(value) ? Number(value) : NaN;
+  return count >= 1 && count <= MAX_BOTS_PER_MEETING ? count : undefined;
+}
+
+/** Every name for a few bots; a sample for many, to fit a Telegram message. */
+function botList(names: string[]): string {
+  return names.length <= 5
+    ? names.join(', ')
+    : `${names.slice(0, 3).join(', ')} and ${names.length - 3} more`;
+}
+
 @Update()
 export class TelegramUpdate {
   private readonly logger = new Logger(TelegramUpdate.name);
@@ -43,6 +69,7 @@ export class TelegramUpdate {
 
   constructor(
     private readonly zoom: ZoomService,
+    private readonly auth: AuthService,
     private readonly config: ConfigService,
   ) {
     const raw = this.config.get<string>('TELEGRAM_ALLOWED_USER_IDS', '').trim();
@@ -61,17 +88,18 @@ export class TelegramUpdate {
       [
         '👋 I am a Zoom notetaker bot.',
         '',
-        'Send me a Zoom meeting link and I will join it with two bot',
-        'participants, each under a random Indian name tagged "(bot)" so the',
-        'room knows bots are present.',
+        `Send me a Zoom meeting link and say how many bots to send (1–${MAX_BOTS_PER_MEETING}).`,
+        'Each joins under a random Indian name tagged "(bot)" so the room',
+        'knows bots are present.',
         '',
         'Commands:',
-        '• Just paste a Zoom link (or the whole invitation) to join it',
+        '• Just paste a Zoom link (or the whole invitation); I will ask how many bots',
         '• If the meeting needs a passcode, I will ask for it',
         '• /cancel — drop a join that is waiting for your reply',
         '• /status — which meetings I am currently in',
         '• /leave [meetingNumber] — leave one meeting, or all if omitted',
         '• /whoami — show your Telegram user id',
+        `• /logout — end your session now (it also ends after ${minutes(SESSION_IDLE_MS)} idle minutes)`,
       ].join('\n'),
     );
   }
@@ -86,6 +114,49 @@ export class TelegramUpdate {
     await ctx.reply(`Your Telegram user id is: ${ctx.from?.id ?? 'unknown'}`);
   }
 
+  @Command('login')
+  async onLogin(@Ctx() ctx: Context): Promise<void> {
+    const userId = await this.allowedSender(ctx);
+    if (userId === undefined) return;
+    // Keep the password out of the chat history. Telegram only lets the bot
+    // do this in private chats or groups where it is an admin.
+    await ctx.deleteMessage().catch(() => undefined);
+
+    const password = this.commandText(ctx);
+    if (!password) {
+      await ctx.reply('Usage: /login <password>');
+      return;
+    }
+    if (this.auth.touchSession(userId) === 'active') {
+      await ctx.reply('You are already logged in.');
+      return;
+    }
+
+    const result = this.auth.login(userId, password);
+    switch (result.status) {
+      case 'ok':
+        await ctx.reply(
+          `✅ Logged in. Your session ends after ${minutes(SESSION_IDLE_MS)} minutes of inactivity.`,
+        );
+        return;
+      case 'wrong-password':
+        await ctx.reply(
+          `❌ Wrong password. ${result.attemptsLeft} attempt(s) left before a ${minutes(LOCKOUT_MS)}-minute lockout.`,
+        );
+        return;
+      case 'locked':
+        await ctx.reply(lockedMessage(result.retryInMs));
+        return;
+    }
+  }
+
+  @Command('logout')
+  async onLogout(@Ctx() ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    const ended = userId !== undefined && this.auth.logout(userId);
+    await ctx.reply(ended ? '👋 Logged out.' : 'You are not logged in.');
+  }
+
   @Command('status')
   async onStatus(@Ctx() ctx: Context): Promise<void> {
     if (!(await this.guard(ctx))) return;
@@ -97,9 +168,7 @@ export class TelegramUpdate {
     await ctx.reply(
       [
         `Currently in ${active.length} meeting(s):`,
-        ...active.map(
-          (n) => `• ${n}: ${this.zoom.displayNamesIn(n).join(', ')}`,
-        ),
+        ...active.map((n) => `• ${n}: ${botList(this.zoom.displayNamesIn(n))}`),
       ].join('\n'),
     );
   }
@@ -136,17 +205,31 @@ export class TelegramUpdate {
     const url = extractZoomUrl(text);
     const pending = this.pending.get(chatId);
     if (!url && pending) {
-      // The answer to the detail we asked for: retry the join with it.
+      // The answer to what we asked: start or retry the join with it.
       const value = text.trim();
+      if (pending.need === 'count') {
+        const botCount = parseBotCount(value);
+        if (botCount === undefined) {
+          await ctx.reply(
+            `Send a whole number from 1 to ${MAX_BOTS_PER_MEETING}, or /cancel.`,
+          );
+          return;
+        }
+        this.pending.delete(chatId);
+        void this.runJoin(ctx, pending.link, pending.details, botCount);
+        return;
+      }
       if (pending.need === 'email' && !/^\S+@\S+\.\S+$/.test(value)) {
         await ctx.reply("That doesn't look like an email address. Try again, or /cancel.");
         return;
       }
       this.pending.delete(chatId);
-      void this.runJoin(ctx, pending.link, {
-        ...pending.details,
-        [pending.need]: value,
-      });
+      void this.runJoin(
+        ctx,
+        pending.link,
+        { ...pending.details, [pending.need]: value },
+        pending.botCount,
+      );
       return;
     }
 
@@ -175,7 +258,45 @@ export class TelegramUpdate {
 
     // A pasted Zoom invitation often includes "Passcode: abc123" as text.
     const passcode = text.match(/\bpasscode\s*:\s*(\S+)/i)?.[1];
-    void this.runJoin(ctx, link, { passcode });
+    this.pending.set(chatId, { need: 'count', link, details: { passcode } });
+    await ctx.reply(
+      `How many bots should join meeting ${link.meetingNumber}? ` +
+        `Tap one, or type any number from 1 to ${MAX_BOTS_PER_MEETING}.`,
+      Markup.inlineKeyboard(
+        BOT_COUNT_CHOICES.map((n) =>
+          Markup.button.callback(String(n), `bots:${link.meetingNumber}:${n}`),
+        ),
+        { columns: 5 },
+      ),
+    );
+  }
+
+  /** A tap on one of the "how many bots" buttons. */
+  @Action(/^bots:/)
+  async onBotCountChosen(@Ctx() ctx: Context): Promise<void> {
+    await ctx.answerCbQuery().catch(() => undefined); // stop the button's spinner
+    if (!(await this.guard(ctx))) return;
+
+    const data =
+      ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
+    const [, meetingNumber, count] = data.split(':');
+    const chatId = ctx.chat?.id;
+    const pending = chatId === undefined ? undefined : this.pending.get(chatId);
+    const botCount = parseBotCount(count ?? '');
+    if (
+      chatId === undefined ||
+      pending?.need !== 'count' ||
+      pending.link.meetingNumber !== meetingNumber ||
+      botCount === undefined
+    ) {
+      await ctx.reply('That question has expired. Send the Zoom link again.');
+      return;
+    }
+
+    this.pending.delete(chatId);
+    // Drop the buttons so the same question can't start a second join.
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    void this.runJoin(ctx, pending.link, pending.details, botCount);
   }
 
   /**
@@ -186,6 +307,7 @@ export class TelegramUpdate {
     ctx: Context,
     link: ParsedZoomLink,
     details: JoinDetails,
+    botCount: number,
   ): Promise<void> {
     const meeting = link.meetingNumber;
     const say = (message: string) =>
@@ -193,15 +315,25 @@ export class TelegramUpdate {
         .reply(message)
         .catch((e) => this.logger.warn(`Could not send Telegram reply: ${e}`));
 
-    await say(`Joining meeting ${meeting}…`);
+    await say(`Joining meeting ${meeting} with ${botCount} bot(s)…`);
     try {
-      const names = await this.zoom.join(link, details, (state) => {
-        void say(WAIT_MESSAGES[state]);
-      });
-      await say(`✅ Joined meeting ${meeting} as ${names.join(' and ')}.`);
+      const { joined, failed, failureReason } = await this.zoom.join(
+        link,
+        details,
+        botCount,
+        (state) => {
+          void say(WAIT_MESSAGES[state]);
+        },
+      );
+      await say(
+        failed === 0
+          ? `✅ Joined meeting ${meeting} with ${joined.length} bot(s): ${botList(joined)}.`
+          : `⚠️ Only ${joined.length} of ${botCount} bots got into meeting ${meeting}: ` +
+              `${botList(joined)}.\nThe other ${failed} didn't: ${failureReason}`,
+      );
     } catch (err) {
       if (err instanceof JoinNeedsInputError && ctx.chat) {
-        this.pending.set(ctx.chat.id, { link, details, need: err.need });
+        this.pending.set(ctx.chat.id, { need: err.need, link, details, botCount });
         await say(`🔒 ${err.message} ${ASK_FOR[err.need]}, or /cancel.`);
         return;
       }
@@ -213,17 +345,51 @@ export class TelegramUpdate {
 
   // ─── helpers ──────────────────────────────────────────────────────────────
 
-  /** Returns true if the sender is permitted; replies and returns false if not. */
+  /**
+   * Returns true if the sender is permitted and logged in, keeping their
+   * session alive; replies and returns false if not.
+   */
   private async guard(ctx: Context): Promise<boolean> {
-    if (this.allowedUserIds.size === 0) {
-      return true; // open to anyone who can message the bot
+    const userId = await this.allowedSender(ctx);
+    if (userId === undefined) return false;
+
+    switch (this.auth.touchSession(userId)) {
+      case 'active':
+        return true;
+      case 'expired':
+        await ctx.reply(
+          `🔒 Your session ended after ${minutes(SESSION_IDLE_MS)} minutes of inactivity. ${LOGIN_PROMPT}`,
+        );
+        return false;
+      case 'none': {
+        const lockedFor = this.auth.lockedFor(userId);
+        await ctx.reply(lockedFor > 0 ? lockedMessage(lockedFor) : `🔒 ${LOGIN_PROMPT}`);
+        return false;
+      }
     }
+  }
+
+  /**
+   * The sender's user id if the allow-list permits them (anyone, when it is
+   * empty); replies and returns undefined if not.
+   */
+  private async allowedSender(ctx: Context): Promise<number | undefined> {
     const id = ctx.from?.id;
-    if (id && this.allowedUserIds.has(id)) {
-      return true;
+    if (
+      id !== undefined &&
+      (this.allowedUserIds.size === 0 || this.allowedUserIds.has(id))
+    ) {
+      return id;
     }
     await ctx.reply('⛔ You are not authorised to use this bot.');
-    return false;
+    return undefined;
+  }
+
+  /** Everything after the command, e.g. "my pass" in "/login my pass". */
+  private commandText(ctx: Context): string {
+    const text =
+      ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+    return text.replace(/^\/\S+\s*/, '').trim();
   }
 
   private commandArg(ctx: Context): string | undefined {
