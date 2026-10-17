@@ -63,6 +63,25 @@ export function generateName(id: number, religion?: Religion): GeneratedName {
   return { id, firstName, lastName, fullName: `${firstName} ${lastName}` };
 }
 
+/**
+ * A random name from one religion. Without a religion, one is chosen in
+ * proportion to its list size, so first and last names always match.
+ */
+export function randomName(religion: Religion = randomReligion()): GeneratedName {
+  return generateName(1 + Math.floor(Math.random() * maxNameId(religion)), religion);
+}
+
+function randomReligion(): Religion {
+  let pick = Math.floor(Math.random() * COMBINED.firstNames.length);
+  for (const religion of RELIGIONS) {
+    pick -= NAME_POOLS[religion].firstNames.length;
+    if (pick < 0) {
+      return religion;
+    }
+  }
+  return RELIGIONS[0]; // unreachable: the pool sizes sum to COMBINED's
+}
+
 function poolFor(religion?: Religion): NamePool {
   if (religion === undefined) {
     return COMBINED;
@@ -111,5 +130,9 @@ export class NameGeneratorService {
 
   maxId(religion?: Religion): number {
     return maxNameId(religion);
+  }
+
+  random(religion?: Religion): GeneratedName {
+    return randomName(religion);
   }
 }

@@ -1,8 +1,8 @@
 # Zoombot
 
-A Telegram bot (NestJS + Bun) that makes a **single** headless-browser client
-join a Zoom meeting from a link you send it. Right now it only *joins* — it
-identifies itself in the room, turns off camera/mic, and sits there. Note-taking
+A Telegram bot (NestJS + Bun) that makes **two** headless-browser clients join a
+Zoom meeting from a link you send it. Right now they only *join* — each takes a
+random Indian name tagged "(bot)", turns off camera/mic, and sits there. Note-taking
 and summaries are deliberately not implemented yet; this is the foundation.
 
 ## ⚠️ Read this before you rely on it
@@ -20,7 +20,7 @@ Service**, and it is inherently fragile:
   overrides) will need updating. The bot saves a screenshot to
   `./debug-screenshots/` on failure to help with this.
 - Only use it on meetings **you host or are authorised to join**, and keep the
-  bot's display name clearly bot-like so participants know a bot is present.
+  "(bot)" tag on display names so participants know bots are present.
   Many jurisdictions require consent to record/transcribe a meeting.
 - If/when you add note-taking, the compliant long-term path is **Zoom RTMS**
   (real-time media streams). Consider migrating the join mechanism then.
@@ -65,7 +65,7 @@ polls Telegram for messages — no public URL/webhook required.
 
 | Action | What happens |
 | --- | --- |
-| Paste a Zoom link | The bot joins that meeting as one participant |
+| Paste a Zoom link | Two bots join that meeting, e.g. "Arnab Chatterjee (bot)" and "Jasleen Sandhu (bot)" |
 | `/status` | Lists the meetings the bot is currently in |
 | `/leave [meetingNumber]` | Leaves one meeting, or all meetings if omitted |
 | `/whoami` | Shows your Telegram user id (for the allow-list) |

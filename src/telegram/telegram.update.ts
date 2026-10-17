@@ -30,9 +30,9 @@ export class TelegramUpdate {
       [
         '👋 I am a Zoom notetaker bot.',
         '',
-        'Send me a Zoom meeting link and I will join it as a single',
-        'participant named exactly what my config says (so the room knows a',
-        'bot is present).',
+        'Send me a Zoom meeting link and I will join it with two bot',
+        'participants, each under a random Indian name tagged "(bot)" so the',
+        'room knows bots are present.',
         '',
         'Commands:',
         '• Just paste a Zoom link to join it',
@@ -61,7 +61,14 @@ export class TelegramUpdate {
       await ctx.reply('Not in any meetings right now.');
       return;
     }
-    await ctx.reply(`Currently in ${active.length} meeting(s): ${active.join(', ')}`);
+    await ctx.reply(
+      [
+        `Currently in ${active.length} meeting(s):`,
+        ...active.map(
+          (n) => `• ${n}: ${this.zoom.displayNamesIn(n).join(', ')}`,
+        ),
+      ].join('\n'),
+    );
   }
 
   @Command('leave')
@@ -110,8 +117,10 @@ export class TelegramUpdate {
 
     await ctx.reply(`Joining meeting ${link.meetingNumber}…`);
     try {
-      await this.zoom.join(link);
-      await ctx.reply(`✅ Joined meeting ${link.meetingNumber}.`);
+      const names = await this.zoom.join(link);
+      await ctx.reply(
+        `✅ Joined meeting ${link.meetingNumber} as ${names.join(' and ')}.`,
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`Failed to join ${link.meetingNumber}: ${message}`);

@@ -7,11 +7,18 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import puppeteer, { Browser, Page } from 'puppeteer';
+import { NameGeneratorService } from '../name-generator/name-generator.service';
 import { ParsedZoomLink } from './zoom-url.util';
+
+/** How many separate bot participants join each meeting. */
+const BOTS_PER_MEETING = 2;
+
+/** Appended to every generated name so the room can tell the bots from people. */
+const BOT_NAME_TAG = ' (bot)';
 
 interface MeetingSession {
   browser: Browser;
-  page: Page;
+  displayNames: string[];
   link: ParsedZoomLink;
   joinedAt: Date;
 }
@@ -21,7 +28,10 @@ export class ZoomService implements OnModuleDestroy {
   private readonly logger = new Logger(ZoomService.name);
   private readonly sessions = new Map<string, MeetingSession>();
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    private readonly names: NameGeneratorService,
+  ) {}
 
   activeCount(): number {
     return this.sessions.size;
@@ -35,27 +45,66 @@ export class ZoomService implements OnModuleDestroy {
     return this.sessions.has(meetingNumber);
   }
 
+  /** The display names the bots in a meeting joined as. */
+  displayNamesIn(meetingNumber: string): string[] {
+    return this.sessions.get(meetingNumber)?.displayNames ?? [];
+  }
+
   /**
-   * Open the Zoom web client in a headless browser and join the meeting as a
-   * single, self-identified participant (muted, no video).
+   * Open the Zoom web client in a headless browser and join the meeting with
+   * BOTS_PER_MEETING participants (muted, no video), each in its own browser
+   * context under a distinct random Indian name tagged as a bot. All or
+   * nothing: if any bot fails to join, the others are closed too.
+   *
+   * @returns the display names the bots joined as
    */
-  async join(link: ParsedZoomLink): Promise<void> {
+  async join(link: ParsedZoomLink): Promise<string[]> {
     if (this.sessions.has(link.meetingNumber)) {
       throw new Error(`Already in meeting ${link.meetingNumber}.`);
     }
 
-    const displayName = this.config.get<string>(
-      'ZOOM_BOT_DISPLAY_NAME',
-      'Zoombot (Notetaker)',
+    const displayNames = this.pickDisplayNames(BOTS_PER_MEETING);
+    const browser = await this.launchBrowser();
+
+    // Join concurrently, but let every bot settle before closing the browser
+    // so one bot's failure doesn't pull pages out from under another mid-join.
+    const results = await Promise.allSettled(
+      displayNames.map((name, i) => this.joinAs(browser, link, name, i + 1)),
     );
+    const failure = results.find(
+      (r): r is PromiseRejectedResult => r.status === 'rejected',
+    );
+    if (failure) {
+      await browser.close().catch(() => undefined);
+      throw failure.reason;
+    }
+
+    this.sessions.set(link.meetingNumber, {
+      browser,
+      displayNames,
+      link,
+      joinedAt: new Date(),
+    });
+    this.logger.log(
+      `Joined meeting ${link.meetingNumber} as ${displayNames.join(', ')}.`,
+    );
+    return displayNames;
+  }
+
+  /** Join one bot in its own browser context, so Zoom sees a separate client. */
+  private async joinAs(
+    browser: Browser,
+    link: ParsedZoomLink,
+    displayName: string,
+    botNumber: number,
+  ): Promise<void> {
     const stepTimeout = Number(
       this.config.get<string>('ZOOM_STEP_TIMEOUT_MS', '45000'),
     );
 
-    const browser = await this.launchBrowser();
-    let page: Page;
+    const context = await browser.createBrowserContext();
+    const page = await context.newPage();
     try {
-      page = await browser.newPage();
       await page.setViewport({ width: 1280, height: 800 });
       await page.setUserAgent(
         'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
@@ -90,23 +139,23 @@ export class ZoomService implements OnModuleDestroy {
       }
 
       await this.handlePostJoin(page);
-
-      this.sessions.set(link.meetingNumber, {
-        browser,
-        page,
-        link,
-        joinedAt: new Date(),
-      });
-      this.logger.log(`Joined meeting ${link.meetingNumber}.`);
     } catch (err) {
-      // Look the page up from the browser: `page` is unassigned if newPage() threw.
       await this.captureDebugScreenshot(
-        await this.firstPage(browser),
-        link.meetingNumber,
+        page,
+        `${link.meetingNumber}-bot${botNumber}`,
       );
-      await browser.close().catch(() => undefined);
-      throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Bot ${botNumber} ("${displayName}"): ${message}`);
     }
+  }
+
+  /** Distinct random Indian names, each tagged so participants know it's a bot. */
+  private pickDisplayNames(count: number): string[] {
+    const names = new Set<string>();
+    while (names.size < count) {
+      names.add(this.names.random().fullName + BOT_NAME_TAG);
+    }
+    return [...names];
   }
 
   /** Leave a specific meeting (closes its browser). */
@@ -310,28 +359,19 @@ export class ZoomService implements OnModuleDestroy {
     }
   }
 
-  private async firstPage(browser: Browser): Promise<Page | undefined> {
-    try {
-      const pages = await browser.pages();
-      return pages[0];
-    } catch {
-      return undefined;
-    }
-  }
-
   private async captureDebugScreenshot(
-    page: Page | undefined,
-    meetingNumber: string,
+    page: Page,
+    label: string,
   ): Promise<void> {
     const enabled =
       this.config.get<string>('ZOOM_DEBUG_SCREENSHOTS', 'true') !== 'false';
-    if (!enabled || !page) {
+    if (!enabled) {
       return;
     }
     try {
       const dir = pathJoin(process.cwd(), 'debug-screenshots');
       await fs.mkdir(dir, { recursive: true });
-      const file = pathJoin(dir, `${meetingNumber}-${Date.now()}.png`);
+      const file = pathJoin(dir, `${label}-${Date.now()}.png`);
       await page.screenshot({ path: file, fullPage: true });
       this.logger.warn(`Join failed — saved a debug screenshot to ${file}`);
     } catch (e) {
