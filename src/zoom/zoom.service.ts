@@ -32,7 +32,7 @@ const MAX_SCREENSHOTS = 20;
 const DETAIL_ACCEPT_WAIT_MS = 15_000;
 
 /** Appended to every generated name so the room can tell the bots from people. */
-const BOT_NAME_TAG = ' (bot)';
+const BOT_NAME_TAG = '';
 
 /** Details only some meetings ask for; the user supplies them on request. */
 export interface JoinDetails {
