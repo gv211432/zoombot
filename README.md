@@ -1,0 +1,101 @@
+# Zoombot
+
+A Telegram bot (NestJS + Bun) that makes a **single** headless-browser client
+join a Zoom meeting from a link you send it. Right now it only *joins* — it
+identifies itself in the room, turns off camera/mic, and sits there. Note-taking
+and summaries are deliberately not implemented yet; this is the foundation.
+
+## ⚠️ Read this before you rely on it
+
+This bot joins by **automating Zoom's in-browser web client** with Puppeteer. It
+does **not** use the Zoom Meeting SDK, because Zoom's Meeting SDK docs now state
+the SDK "is reserved for human use cases and does not support bots or AI
+notetakers," pointing notetakers to **Zoom RTMS** instead.
+
+Automating the web client is a **grey area under Zoom's general Terms of
+Service**, and it is inherently fragile:
+
+- Zoom changes its web-client HTML without notice. When a join starts failing,
+  the CSS selectors in `src/zoom/zoom.service.ts` (or the `ZOOM_SEL_*` env
+  overrides) will need updating. The bot saves a screenshot to
+  `./debug-screenshots/` on failure to help with this.
+- Only use it on meetings **you host or are authorised to join**, and keep the
+  bot's display name clearly bot-like so participants know a bot is present.
+  Many jurisdictions require consent to record/transcribe a meeting.
+- If/when you add note-taking, the compliant long-term path is **Zoom RTMS**
+  (real-time media streams). Consider migrating the join mechanism then.
+
+## Prerequisites
+
+- [Bun](https://bun.sh) ≥ 1.4 (used as package manager / runtime). Node ≥ 20 also
+  works if you prefer `node`.
+- A Telegram bot token from [@BotFather](https://t.me/BotFather).
+- Chromium is downloaded automatically by Puppeteer on install. On Linux servers
+  you may need its shared libraries (e.g. `apt-get install -y libnss3 libatk1.0-0
+  libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1
+  libxrandr2 libgbm1 libasound2`).
+
+## Setup
+
+```bash
+bun install
+cp .env.example .env
+# then edit .env and set TELEGRAM_BOT_TOKEN
+```
+
+> 🔐 The bot token that was shared in chat should be considered compromised.
+> Revoke it in @BotFather (`/mybots` → your bot → **API Token** → **Revoke
+> current token**) and put the fresh token in `.env` — never commit `.env`.
+
+## Run
+
+```bash
+# development (auto-reload)
+bun run start:dev
+
+# production
+bun run build
+bun run start:prod   # or: node dist/main.js
+```
+
+The process exposes `GET /health` (port from `HEALTH_PORT`, default 3000) and
+polls Telegram for messages — no public URL/webhook required.
+
+## Usage (in Telegram)
+
+| Action | What happens |
+| --- | --- |
+| Paste a Zoom link | The bot joins that meeting as one participant |
+| `/status` | Lists the meetings the bot is currently in |
+| `/leave [meetingNumber]` | Leaves one meeting, or all meetings if omitted |
+| `/whoami` | Shows your Telegram user id (for the allow-list) |
+
+Supported link shapes: `https://…zoom.us/j/{id}?pwd=…`, `/wc/join/{id}`,
+`/wc/{id}/join`, `/s/{id}`, `/w/{id}`. Personal-link (`…/my/alias`) and
+registration URLs are **not** supported — send the numeric `/j/` link.
+
+### Restricting who can use it
+
+Set `TELEGRAM_ALLOWED_USER_IDS` in `.env` to a comma-separated list of numeric
+Telegram user ids (use `/whoami` to find yours). Leave empty to allow anyone who
+can message the bot.
+
+## Project layout
+
+```
+src/
+├── main.ts                  # bootstrap (HTTP health + Telegraf polling)
+├── app.module.ts            # wires ConfigModule, TelegrafModule, modules
+├── health.controller.ts     # GET /health
+├── telegram/
+│   ├── telegram.module.ts
+│   └── telegram.update.ts   # Telegram commands + link handling
+└── zoom/
+    ├── zoom.module.ts
+    ├── zoom.service.ts       # Puppeteer: open web client + join
+    └── zoom-url.util.ts      # parse Zoom links → web-client join URL
+```
+
+## Configuration reference
+
+See `.env.example` — every variable is documented there.
