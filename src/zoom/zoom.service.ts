@@ -131,14 +131,6 @@ interface MeetingSession {
   onEnded?: (reason: string) => void;
   /** Per-session copy of the Chromium profile; removed on leave. */
   profileDir?: string;
-  /**
-   * Zoom auth cookies harvested from the default browser context, which is
-   * the one that reads userDataDir. Each bot's isolated context starts with
-   * an empty jar, so we replay these cookies into every new context before
-   * the bot navigates — otherwise Zoom sees each bot as a brand-new guest
-   * and the data-center IP block kicks in.
-   */
-  authCookies?: unknown[];
 }
 
 @Injectable()
@@ -234,12 +226,6 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
     };
     this.sessions.set(meetingNumber, session);
     try {
-      session.authCookies = await this.harvestAuthCookies(browser);
-      if (session.authCookies.length > 0) {
-        this.logger.log(
-          `Loaded ${session.authCookies.length} Zoom auth cookies from the saved profile.`,
-        );
-      }
       return await this.joinAll(session, details, botCount, events.onWait);
     } catch (err) {
       if (this.sessions.get(meetingNumber) === session) {
@@ -368,20 +354,20 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
       this.config.get<string>('ZOOM_STEP_TIMEOUT_MS', '45000'),
     );
 
-    // Each bot gets its own browser context so cookies, localStorage and
-    // IndexedDB are isolated. Without this, every tab shares Zoom's session
-    // state and the newest join silently kicks every earlier bot out of the
-    // meeting — only the last tab survives.
-    const context = await browser.createBrowserContext();
-    const page = await context.newPage();
+    // Use the DEFAULT browser context so every bot inherits the signed-in
+    // Zoom session (cookies + localStorage + IndexedDB) from userDataDir.
+    // Isolated contexts (createBrowserContext) start empty for localStorage
+    // and IndexedDB — cookie-only replay isn't enough because Zoom's web
+    // client reads JWTs/user state from localStorage on load and redirects
+    // to sign-in when it's missing.
+    //
+    // Zoom's signed-in web client allows multiple tabs of the same account
+    // to be separate meeting participants, so sharing the session jar does
+    // NOT make bots kick each other out — unlike the guest-join flow that
+    // led us to isolated contexts earlier.
+    const page = await browser.newPage();
     try {
       await page.setViewport({ width: 1280, height: 800 });
-      // Replay the Zoom login cookies into this bot's empty jar BEFORE the
-      // first navigation, otherwise Zoom treats us as a brand-new guest and
-      // the data-center IP block kicks in.
-      if (session.authCookies && session.authCookies.length > 0) {
-        await page.setCookie(...(session.authCookies as Parameters<typeof page.setCookie>));
-      }
       const chromeVersion = await this.spoofMacFingerprint(browser, page);
 
       this.logger.log(
@@ -849,38 +835,6 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
       }
     }, majorVersion);
     return chromeVersion;
-  }
-
-  /**
-   * Pull every cookie the saved profile has for Zoom's domains out of the
-   * default browser context (which is the one that reads userDataDir).
-   * We'll replay these into each bot's isolated context so the bot inherits
-   * the signed-in session rather than looking like a brand-new guest.
-   */
-  private async harvestAuthCookies(browser: Browser): Promise<unknown[]> {
-    const defaultCtx = browser.defaultBrowserContext();
-    // Use a hidden page in the default context so cookies() returns the
-    // userDataDir-backed jar for Zoom's domains.
-    const page = await defaultCtx.newPage();
-    try {
-      // We don't need to actually load Zoom — the cookie jar is populated
-      // from userDataDir at browser start. Fetching via about:blank is
-      // enough for page.cookies() to return the stored cookies for the
-      // URLs we ask about.
-      const cookies = await page.cookies(
-        'https://zoom.us/',
-        'https://app.zoom.us/',
-        'https://web.zoom.us/',
-        'https://go.zoom.us/',
-        'https://us02web.zoom.us/',
-      );
-      return cookies;
-    } catch (e) {
-      this.logger.warn(`Could not harvest Zoom auth cookies: ${e}`);
-      return [];
-    } finally {
-      await page.close().catch(() => undefined);
-    }
   }
 
   /**
