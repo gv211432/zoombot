@@ -1,19 +1,23 @@
 import { spawn } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { createReadStream, promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join as pathJoin } from 'node:path';
+import { basename, join as pathJoin } from 'node:path';
 import {
   BadRequestException,
   Controller,
   ForbiddenException,
+  Get,
   Headers,
   HttpCode,
   Logger,
+  NotFoundException,
+  Param,
   Post,
   Req,
+  Res,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
 
 /**
  * One-time, token-protected endpoint for uploading a `zoom-profile/` tarball
@@ -94,6 +98,74 @@ export class ProfileUploadController {
 
     this.logger.log(`Zoom profile installed at ${profileDir}.`);
     return { ok: true, path: profileDir };
+  }
+
+  /**
+   * List debug screenshots (newest first). Protected by the same admin
+   * token so you can see what Zoom actually showed when a join failed.
+   *
+   *   curl -H "X-Admin-Token: $TOKEN" https://.../admin/screenshots
+   */
+  @Get('screenshots')
+  async list(
+    @Headers('x-admin-token') token: string,
+  ): Promise<{ files: Array<{ name: string; size: number; mtime: string }> }> {
+    this.checkToken(token);
+    const dir = pathJoin(process.cwd(), 'debug-screenshots');
+    try {
+      const names = await fs.readdir(dir);
+      const files = await Promise.all(
+        names
+          .filter((n) => n.endsWith('.png'))
+          .map(async (name) => {
+            const s = await fs.stat(pathJoin(dir, name));
+            return { name, size: s.size, mtime: s.mtime.toISOString() };
+          }),
+      );
+      files.sort((a, b) => b.mtime.localeCompare(a.mtime));
+      return { files };
+    } catch {
+      return { files: [] };
+    }
+  }
+
+  /**
+   * Download a single screenshot by name.
+   *
+   *   curl -H "X-Admin-Token: $TOKEN" https://.../admin/screenshots/NAME.png -o shot.png
+   */
+  @Get('screenshots/:name')
+  async get(
+    @Headers('x-admin-token') token: string,
+    @Param('name') name: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    this.checkToken(token);
+    // Prevent path traversal: strip to basename and allow only .png.
+    const safeName = basename(name);
+    if (!safeName.endsWith('.png')) {
+      throw new NotFoundException('Only .png screenshots are served.');
+    }
+    const filePath = pathJoin(process.cwd(), 'debug-screenshots', safeName);
+    try {
+      await fs.access(filePath);
+    } catch {
+      throw new NotFoundException(`No such screenshot: ${safeName}`);
+    }
+    res.setHeader('Content-Type', 'image/png');
+    createReadStream(filePath).pipe(res);
+  }
+
+  private checkToken(token: string): void {
+    const expected = this.config.get<string>('ADMIN_UPLOAD_TOKEN', '').trim();
+    if (!expected) {
+      throw new ForbiddenException(
+        'Admin endpoints are disabled: ADMIN_UPLOAD_TOKEN is not set.',
+      );
+    }
+    if (!token || token !== expected) {
+      throw new ForbiddenException('Invalid or missing X-Admin-Token header.');
+    }
   }
 
   private runTar(args: string[]): Promise<void> {
