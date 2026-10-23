@@ -69,8 +69,12 @@ export class ProfileUploadController {
     await fs.writeFile(tmpFile, body);
 
     // Wipe any existing profile so we don't mix two Chromium users' state.
-    await fs.rm(profileDir, { recursive: true, force: true });
+    // profileDir may be a mount point (Railway volume), which can't itself
+    // be rmdir'd — only its contents can be removed.
     await fs.mkdir(profileDir, { recursive: true });
+    for (const entry of await fs.readdir(profileDir)) {
+      await fs.rm(pathJoin(profileDir, entry), { recursive: true, force: true });
+    }
 
     // The tarball on the laptop was created with `tar czf zp.tgz zoom-profile`,
     // so entries are prefixed with `zoom-profile/`. --strip-components=1 drops
