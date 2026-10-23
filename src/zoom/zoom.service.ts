@@ -850,11 +850,11 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
     }
     const src = this.zoomProfileDir();
     const dst = pathJoin(tmpdir(), `zoom-profile-${meetingNumber}-${Date.now()}`);
-    // Skip files that encode host-machine identity or stale lock state.
-    // Chromium regenerates these; copying them from a host-created profile
-    // into a container causes "another computer owns this profile" refusals
-    // or outright crashes (Local State holds an OS-keyring-encrypted key).
-    const SKIP = /\/(Singleton(Lock|Cookie|Socket)|lockfile|Local State|RunningChromeVersion)$/;
+    // Skip only lock/socket files that Chromium regenerates. We used to
+    // strip "Local State" too, but with --password-store=basic the cookie
+    // encryption key stored there is a deterministic fallback and MUST be
+    // kept so Chrome can decrypt the uploaded Zoom cookies on this host.
+    const SKIP = /\/(Singleton(Lock|Cookie|Socket)|lockfile|RunningChromeVersion)$/;
     await fs.cp(src, dst, {
       recursive: true,
       filter: (source) => !SKIP.test(source),
@@ -901,6 +901,14 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
         // video pipeline fails to initialise and the client silently exits
         // right after login. Opt in to the SwiftShader software renderer.
         '--enable-unsafe-swiftshader',
+        // Force the "basic" cookie-encryption password store so the key is
+        // a deterministic fallback instead of being wrapped by gnome-keyring
+        // / kwallet. Without this, cookies written on a laptop can't be
+        // decrypted on Railway (no keyring daemon in the container) and the
+        // uploaded Zoom login session looks blank. Must be set on BOTH ends
+        // for the profile to be portable.
+        '--password-store=basic',
+        '--use-mock-keychain',
         // Suppress the "Chrome is being controlled by automated software" flag
         // and the navigator.webdriver JS property that Zoom's detection reads.
         '--disable-blink-features=AutomationControlled',
