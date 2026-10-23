@@ -367,6 +367,7 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
     // led us to isolated contexts earlier.
     const page = await browser.newPage();
     try {
+      await this.applyProxyAuth(page);
       await page.setViewport({ width: 1280, height: 800 });
       const chromeVersion = await this.spoofMacFingerprint(browser, page);
 
@@ -568,6 +569,7 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
     const browser = await this.launchBrowser(profileDir);
     const page = await browser.newPage();
     try {
+      await this.applyProxyAuth(page);
       await page.setViewport({ width: 1280, height: 800 });
       await this.spoofMacFingerprint(browser, page);
 
@@ -846,6 +848,18 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
       this.config.get<string>('PUPPETEER_HEADLESS', 'true') !== 'false';
     const dumpio =
       this.config.get<string>('PUPPETEER_DUMPIO', 'false') === 'true';
+
+    // Optional residential proxy, applied to every page via page.authenticate().
+    // PROXY_URL expects just host:port (no scheme is fine, http(s)/socks5 also
+    // works); credentials go in PROXY_USERNAME / PROXY_PASSWORD because
+    // Chromium's --proxy-server flag refuses user:pass in the URL.
+    const proxyUrl = this.config.get<string>('PROXY_URL', '').trim();
+    const extraArgs: string[] = [];
+    if (proxyUrl) {
+      extraArgs.push(`--proxy-server=${proxyUrl}`);
+      this.logger.log(`Routing Chromium through proxy ${proxyUrl}`);
+    }
+
     return puppeteer.launch({
       // In Puppeteer v22+, headless:true uses Chrome's new headless mode
       // (same renderer as a real browser window), not the legacy shell.
@@ -853,6 +867,7 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
       userDataDir,
       dumpio,
       args: [
+        ...extraArgs,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
@@ -881,6 +896,21 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
         '--window-size=1280,800',
       ],
     });
+  }
+
+  /**
+   * Send PROXY_USERNAME / PROXY_PASSWORD on the first HTTP 407 the page
+   * encounters. Chromium's --proxy-server flag can't carry credentials, so
+   * each page has to answer the proxy challenge itself. No-op when the vars
+   * aren't set, so direct connections (laptop, VPS) keep working.
+   */
+  private async applyProxyAuth(page: Page): Promise<void> {
+    const username = this.config.get<string>('PROXY_USERNAME', '').trim();
+    const password = this.config.get<string>('PROXY_PASSWORD', '').trim();
+    if (!username && !password) {
+      return;
+    }
+    await page.authenticate({ username, password });
   }
 
   private nameSelectors(): string[] {
