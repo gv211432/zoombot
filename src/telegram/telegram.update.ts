@@ -110,6 +110,8 @@ export class TelegramUpdate {
         '• 🚪 Leave buttons also appear on join messages, and stop a join in progress',
         '• /whoami — show your Telegram user id',
         `• /logout — end your session now (it also ends after ${minutes(SESSION_IDLE_MS)} idle minutes)`,
+        '• /zoomlogin — sign in to your Zoom account so the bot can join members-only meetings',
+        '• /zoomstatus — check whether the bot is signed in to Zoom',
       ].join('\n'),
     );
   }
@@ -165,6 +167,40 @@ export class TelegramUpdate {
     const userId = ctx.from?.id;
     const ended = userId !== undefined && this.auth.logout(userId);
     await ctx.reply(ended ? '👋 Logged out.' : 'You are not logged in.');
+  }
+
+  /**
+   * Sign the Puppeteer browser into Zoom using ZOOM_EMAIL / ZOOM_PASSWORD.
+   * The session is saved to a persistent Chromium profile on disk, so the
+   * bot will automatically use it for every subsequent join.
+   */
+  @Command('zoomlogin')
+  async onZoomLogin(@Ctx() ctx: Context): Promise<void> {
+    if (!(await this.guard(ctx))) return;
+    await ctx.reply('🔐 Starting Zoom sign-in… this may take up to 60 seconds.');
+    try {
+      await this.zoom.loginWithAccount();
+      await ctx.reply(
+        '✅ Zoom sign-in succeeded! The session is saved — the bot will now be ' +
+          'able to join meetings that require a signed-in user.',
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Zoom login failed: ${msg}`);
+      await ctx.reply(`❌ Zoom sign-in failed:\n${msg}`);
+    }
+  }
+
+  /** Report whether the bot currently has a saved Zoom session on disk. */
+  @Command('zoomstatus')
+  async onZoomStatus(@Ctx() ctx: Context): Promise<void> {
+    if (!(await this.guard(ctx))) return;
+    const loggedIn = await this.zoom.isLoggedIn();
+    await ctx.reply(
+      loggedIn
+        ? '✅ The bot has a saved Zoom session and will join as a signed-in user.'
+        : '⚠️ No saved Zoom session found. Use /zoomlogin to sign in.',
+    );
   }
 
   @Command('status')

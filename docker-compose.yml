@@ -1,0 +1,44 @@
+services:
+  zoombot:
+    image: zoombot:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host   # apt-get needs host DNS; Docker bridge blocks it on this machine
+    container_name: zoombot
+
+    # ── Network ────────────────────────────────────────────────────────────
+    # Use the host's network stack directly. Docker's bridge network has
+    # intermittent DNS/connectivity issues on this machine that cause
+    # Telegram long-polling to time out and crash the bot.
+    # With host networking the app binds directly to host port 3000.
+    network_mode: host
+
+    # ── Environment ────────────────────────────────────────────────────────
+    # Reads from .env on the host.
+    env_file:
+      - .env
+
+    # ── Persistent volumes ─────────────────────────────────────────────────
+    # zoom-profile: Chromium session, bind-mounted from host so a one-time
+    # /zoomlogin on the host (with a visible browser) is reused by every
+    # container run.
+    # debug-screenshots: Failure snapshots readable from the host
+    volumes:
+      - ./zoom-profile:/app/zoom-profile
+      - ./debug-screenshots:/app/debug-screenshots
+
+    # ── Resource limits (safe defaults for headless Chrome) ────────────────
+    # Chrome needs /dev/shm larger than the default 64 MB or it will crash.
+    shm_size: "512mb"
+
+    # ── Restart policy ─────────────────────────────────────────────────────
+    restart: unless-stopped
+
+    # ── Logging ───────────────────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

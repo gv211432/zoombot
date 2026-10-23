@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join as pathJoin } from 'node:path';
 import {
   Injectable,
@@ -9,10 +10,16 @@ import {
 import { ConfigService } from '@nestjs/config';
 import puppeteer, {
   Browser,
-  BrowserContext,
   ElementHandle,
   Page,
 } from 'puppeteer';
+// Note: we deliberately do NOT use puppeteer-extra / stealth plugin.
+// Its target-tracking hook calls Target.setAutoAttach on every new target,
+// and on Puppeteer 23 + modern Chromium many short-lived auxiliary targets
+// (service workers, prerender frames) close before the hook attaches,
+// surfacing as "Protocol error (Target.setAutoAttach): Target closed" and
+// aborting the whole join. The fingerprint spoofing stealth would do is
+// applied directly below in spoofMacFingerprint instead.
 import { NameGeneratorService } from '../name-generator/name-generator.service';
 import { ParsedZoomLink } from './zoom-url.util';
 
@@ -33,6 +40,9 @@ const DETAIL_ACCEPT_WAIT_MS = 15_000;
 
 /** Appended to every generated name so the room can tell the bots from people. */
 const BOT_NAME_TAG = '';
+
+/** Subdirectory inside cwd where Chromium persists its login cookies/profile. */
+const ZOOM_PROFILE_SUBDIR = 'zoom-profile';
 
 /** Details only some meetings ask for; the user supplies them on request. */
 export interface JoinDetails {
@@ -108,7 +118,6 @@ type JoinState =
 
 interface BotTab {
   name: string;
-  context: BrowserContext;
   page: Page;
 }
 
@@ -120,6 +129,8 @@ interface MeetingSession {
   bots: BotTab[];
   joining: boolean;
   onEnded?: (reason: string) => void;
+  /** Per-session copy of the Chromium profile; removed on leave. */
+  profileDir?: string;
 }
 
 @Injectable()
@@ -194,12 +205,24 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
     if (this.sessions.has(meetingNumber)) {
       throw new Error(`Already in or joining meeting ${meetingNumber}.`);
     }
+    const profileDir = await this.cloneProfileForSession(meetingNumber);
+    const browser = await this.launchBrowser(profileDir);
+    const proc = browser.process();
+    proc?.on('exit', (code, signal) => {
+      this.logger.warn(
+        `Chromium for ${meetingNumber} exited (code=${code}, signal=${signal})`,
+      );
+    });
+    browser.on('disconnected', () => {
+      this.logger.warn(`Puppeteer browser for ${meetingNumber} disconnected`);
+    });
     const session: MeetingSession = {
-      browser: await this.launchBrowser(),
+      browser,
       link,
       bots: [],
       joining: true,
       onEnded: events.onEnded,
+      profileDir,
     };
     this.sessions.set(meetingNumber, session);
     try {
@@ -260,11 +283,18 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
           }
           firstError ??= err;
           if (err instanceof JoinNeedsInputError || err instanceof MeetingClosedError) {
-            // Close the browser so the other bots stop too, rather than
-            // sitting in a waiting room for minutes.
-            fatal = stopped = true;
-            firstError = err;
-            await browser.close().catch(() => undefined);
+            // If other bots are already in the meeting, this must be a
+            // per-bot block (Zoom's bot-detection on one tab, or a rate
+            // limit), not a meeting-wide problem — tearing the browser
+            // down would kick the siblings that already made it in. Just
+            // stop spawning more; let the ones in stay in.
+            if (session.bots.length > 0) {
+              stopped = true;
+            } else {
+              fatal = stopped = true;
+              firstError = err;
+              await browser.close().catch(() => undefined);
+            }
           } else if (
             err instanceof MeetingFullError ||
             ++failuresInARow >= MAX_FAILURES_IN_A_ROW
@@ -323,17 +353,18 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
       this.config.get<string>('ZOOM_STEP_TIMEOUT_MS', '45000'),
     );
 
+    // Each bot gets its own browser context so cookies, localStorage and
+    // IndexedDB are isolated. Without this, every tab shares Zoom's session
+    // state and the newest join silently kicks every earlier bot out of the
+    // meeting — only the last tab survives.
     const context = await browser.createBrowserContext();
     const page = await context.newPage();
     try {
       await page.setViewport({ width: 1280, height: 800 });
-      await page.setUserAgent(
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      );
+      const chromeVersion = await this.spoofMacFingerprint(browser, page);
 
       this.logger.log(
-        `Opening web client for meeting ${link.meetingNumber} as "${displayName}"`,
+        `Opening web client for meeting ${link.meetingNumber} as "${displayName}" (Chrome ${chromeVersion})`,
       );
       await page.goto(link.webClientUrl, {
         waitUntil: 'networkidle2',
@@ -373,7 +404,7 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
         onWait,
       );
       await this.handlePostJoin(page);
-      return { name: displayName, context, page };
+      return { name: displayName, page };
     } catch (err) {
       // A missing detail isn't a page problem, and once the browser is closed
       // (the whole join stopped) there's no page left to capture.
@@ -392,7 +423,7 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
       );
       // A closed meeting ends the whole join; otherwise only this bot leaves.
       if (!(failure instanceof MeetingClosedError)) {
-        await context.close().catch(() => undefined);
+        await page.close().catch(() => undefined);
       }
       throw failure;
     }
@@ -420,6 +451,11 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
     await session.browser.close().catch((e) =>
       this.logger.warn(`Error closing browser for ${meetingNumber}: ${e}`),
     );
+    if (session.profileDir) {
+      await fs.rm(session.profileDir, { recursive: true, force: true }).catch(
+        (e) => this.logger.warn(`Error removing profile ${session.profileDir}: ${e}`),
+      );
+    }
     this.logger.log(`Left meeting ${meetingNumber}.`);
     return true;
   }
@@ -458,7 +494,7 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
           reason = 'the meeting ended or the host removed them';
           for (const bot of [...session.bots]) {
             if (bot.page.isClosed() || (await this.readJoinState(bot.page)) === 'unavailable') {
-              await bot.context.close().catch(() => undefined);
+              await bot.page.close().catch(() => undefined);
               session.bots.splice(session.bots.indexOf(bot), 1);
               this.logger.log(`Bot "${bot.name}" is no longer in meeting ${meetingNumber}; closed its tab.`);
             }
@@ -480,19 +516,380 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
 
   // ─── internals ──────────────────────────────────────────────────────────
 
-  private async launchBrowser(): Promise<Browser> {
+  /** Absolute path to the persisted Chromium profile directory. */
+  private zoomProfileDir(): string {
+    const override = this.config.get<string>('ZOOM_PROFILE_DIR', '').trim();
+    return override || pathJoin(process.cwd(), ZOOM_PROFILE_SUBDIR);
+  }
+
+  /**
+   * Returns true when a Zoom session cookie exists in the persisted profile,
+   * meaning the bot previously logged in and the session is likely still valid.
+   */
+  async isLoggedIn(): Promise<boolean> {
+    const cookiePath = pathJoin(this.zoomProfileDir(), 'Default', 'Cookies');
+    try {
+      await fs.access(cookiePath);
+      // The cookie file exists — we have logged in at least once.
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Open Zoom's sign-in page in a (non-headless) browser, fill in the
+   * credentials from env, wait for the dashboard to load, then close.
+   * The Chromium profile is persisted to disk so every subsequent `join`
+   * reuses the authenticated session.
+   *
+   * @throws if credentials are missing, the login form is not found, or
+   *         Zoom rejects the password.
+   */
+  async loginWithAccount(): Promise<void> {
+    const email = this.config.get<string>('ZOOM_EMAIL', '').trim();
+    const password = this.config.get<string>('ZOOM_PASSWORD', '').trim();
+    if (!email || !password) {
+      throw new Error(
+        'ZOOM_EMAIL and ZOOM_PASSWORD must be set in the environment before logging in.',
+      );
+    }
+
+    const profileDir = this.zoomProfileDir();
+    await fs.mkdir(profileDir, { recursive: true });
+    this.logger.log(`Starting Zoom login for ${email} (profile: ${profileDir})`);
+
+    // Use a visible browser for login so any CAPTCHA can be spotted; set
+    // PUPPETEER_HEADLESS=false in .env while debugging if needed.
+    const browser = await this.launchBrowser(profileDir);
+    const page = await browser.newPage();
+    try {
+      await page.setViewport({ width: 1280, height: 800 });
+      await this.spoofMacFingerprint(browser, page);
+
+      this.logger.log('Navigating to Zoom sign-in page…');
+      await page.goto('https://zoom.us/signin', {
+        waitUntil: 'networkidle2',
+        timeout: 60_000,
+      });
+
+      // If already signed in, Zoom redirects to /profile.
+      if (/\/profile/i.test(new URL(page.url()).pathname)) {
+        this.logger.log('Already signed in to Zoom.');
+        return;
+      }
+
+      // The cookie banner sits on top of the Next button and blocks clicks.
+      await this.dismissCookieBanner(page);
+
+      // Zoom's sign-in is a two-step flow: fill email → click Next → the
+      // password field is only mounted after email is accepted. Supporting
+      // both the new (#email_input, #zm_signin_email) and old (#email) ids.
+      const emailFilled = await this.typeIntoFirst(
+        page,
+        ['#email_input', '#zm_signin_email', '#email', 'input[name="email"]', 'input[type="email"]'],
+        email,
+        15_000,
+      );
+      if (!emailFilled) {
+        throw new Error('Could not find the email field on the Zoom sign-in page.');
+      }
+
+      // Click the "Next" button that advances to the password step. Some
+      // layouts put a submit button here; others use a button labelled Next.
+      const nextClicked = await page.evaluate(() => {
+        const candidates = Array.from(
+          document.querySelectorAll<HTMLButtonElement>('button, input[type="submit"]'),
+        );
+        const next = candidates.find((b) => {
+          const label = (b.getAttribute('aria-label') || b.textContent || (b as HTMLInputElement).value || '').trim();
+          return /^next$/i.test(label) || /continue/i.test(label);
+        });
+        if (next) {
+          next.click();
+          return true;
+        }
+        return false;
+      });
+      if (!nextClicked) {
+        this.logger.warn('No "Next" button found; assuming legacy one-step sign-in form.');
+      }
+
+      // Password field appears after Next; give it a generous timeout because
+      // Zoom may do a round-trip to validate the email first.
+      const pwFilled = await this.typeIntoFirst(
+        page,
+        ['#password', '#password_input', 'input[name="password"]', 'input[type="password"]'],
+        password,
+        20_000,
+      );
+      if (!pwFilled) {
+        // If the email was rejected (unknown account, SSO-only, …) Zoom shows
+        // an inline error on the email step instead of moving on.
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        if (/can.?t find.*account|no account|use (your )?SSO|single sign.?on/i.test(bodyText)) {
+          throw new Error(
+            'Zoom did not accept this email on the sign-in page — the account ' +
+              'may not exist, or it requires SSO (which this bot cannot use).',
+          );
+        }
+        throw new Error(
+          'Password field never appeared after submitting the email. Zoom may be ' +
+            'showing a CAPTCHA or extra challenge — check the debug screenshot.',
+        );
+      }
+
+      // Click Sign In.
+      await page.evaluate(() => {
+        const candidates = Array.from(
+          document.querySelectorAll<HTMLButtonElement>('button, input[type="submit"]'),
+        );
+        const signIn = candidates.find((b) => {
+          const label = (b.getAttribute('aria-label') || b.textContent || (b as HTMLInputElement).value || '').trim();
+          return /^sign ?in$/i.test(label) || /^log ?in$/i.test(label);
+        });
+        if (signIn) {
+          signIn.click();
+        } else {
+          // Fallback: any submit button on the form.
+          const anySubmit = document.querySelector<HTMLButtonElement>('button[type="submit"], input[type="submit"]');
+          anySubmit?.click();
+        }
+      });
+
+      // Wait for post-login navigation (profile page, or 2FA, etc.).
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60_000 });
+
+      const finalUrl = page.url();
+      if (/\/signin/i.test(new URL(finalUrl).pathname)) {
+        // Still on the sign-in page — wrong credentials or CAPTCHA.
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        if (/invalid|incorrect|wrong|error/i.test(bodyText)) {
+          throw new Error(
+            'Zoom rejected the credentials (wrong email or password).',
+          );
+        }
+        throw new Error(
+          'Still on the sign-in page after submitting — a CAPTCHA or 2-step ' +
+            'verification may be blocking the login. Check ZOOM_DEBUG_SCREENSHOTS.',
+        );
+      }
+
+      this.logger.log(`Zoom login succeeded (landed on ${finalUrl})`);
+    } catch (err) {
+      // Save a debug screenshot before re-throwing.
+      await this.captureDebugScreenshot(page, 'zoom-login-failed');
+      throw err;
+    } finally {
+      await browser.close().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Make the page look like it's running on macOS so reCAPTCHA's platform
+   * cross-checks (UA, navigator.platform, userAgentData.platform, WebGL
+   * vendor) all agree. The stealth plugin masks headless signals; this layer
+   * flips the OS story from Linux to Mac. Returns the Chrome major version
+   * that was baked into the UA so callers can log it.
+   */
+  private async spoofMacFingerprint(browser: Browser, page: Page): Promise<string> {
+    const realVersion = await browser.version(); // e.g. "Chrome/131.0.6778.204"
+    const chromeVersion = realVersion.match(/\/(\d+\.\S+)/)?.[1] ?? '131.0.6778.204';
+    const majorVersion = chromeVersion.split('.')[0];
+    const macUA = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
+    await page.setUserAgent(macUA);
+
+    // Lie about the OS at every layer the reCAPTCHA iframe inspects.
+    await page.evaluateOnNewDocument((version: string) => {
+      // Hide the headless/automated signals that puppeteer-extra-stealth
+      // used to cover for us.
+      try {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      } catch {
+        /* already defined */
+      }
+      // navigator.languages — headless Chrome defaults to [] on some builds.
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+      });
+      // navigator.plugins — real browsers expose a non-empty PluginArray.
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [
+          { name: 'PDF Viewer', filename: 'internal-pdf-viewer' },
+          { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer' },
+          { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer' },
+          { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer' },
+          { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer' },
+        ],
+      });
+      // window.chrome — stealth's chrome.runtime/app/csi/loadTimes evasion.
+      // Zoom's bot heuristics check for this object's shape.
+      if (!(window as any).chrome) {
+        (window as any).chrome = {
+          runtime: {},
+          app: { isInstalled: false },
+          csi: () => undefined,
+          loadTimes: () => undefined,
+        };
+      }
+      // navigator.permissions.query — headless returns 'denied' for
+      // notifications where a real browser returns 'default'/'prompt'.
+      const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
+      if (originalQuery) {
+        navigator.permissions.query = (parameters: any) =>
+          parameters?.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
+            : originalQuery(parameters);
+      }
+
+      // navigator.platform — still read by many sites despite being deprecated.
+      Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
+
+      // Realistic Mac hardware. A docker container reports host CPU/memory,
+      // which can be an obvious outlier (e.g. 32 cores). Pin to a common
+      // MacBook configuration.
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+      // Mac desktop has no touchscreen; headless default is often 0 already
+      // but set explicitly so cross-checks match.
+      Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+
+      // Realistic MacBook screen metrics (14" MBP ≈ 1512×982 effective).
+      Object.defineProperty(screen, 'width', { get: () => 1512 });
+      Object.defineProperty(screen, 'height', { get: () => 982 });
+      Object.defineProperty(screen, 'availWidth', { get: () => 1512 });
+      Object.defineProperty(screen, 'availHeight', { get: () => 950 });
+      Object.defineProperty(screen, 'colorDepth', { get: () => 30 });
+      Object.defineProperty(screen, 'pixelDepth', { get: () => 30 });
+      Object.defineProperty(window, 'devicePixelRatio', { get: () => 2 });
+
+      // Realistic camera + mic devices so enumerateDevices doesn't return
+      // the headless defaults (empty labels, generic ids).
+      if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+        navigator.mediaDevices.enumerateDevices = async () => [
+          { deviceId: 'default', kind: 'audioinput', label: 'Default - MacBook Pro Microphone', groupId: 'g1', toJSON: () => ({}) } as MediaDeviceInfo,
+          { deviceId: 'communications', kind: 'audioinput', label: 'MacBook Pro Microphone', groupId: 'g1', toJSON: () => ({}) } as MediaDeviceInfo,
+          { deviceId: 'default-out', kind: 'audiooutput', label: 'Default - MacBook Pro Speakers', groupId: 'g2', toJSON: () => ({}) } as MediaDeviceInfo,
+          { deviceId: 'cam-1', kind: 'videoinput', label: 'FaceTime HD Camera', groupId: 'g3', toJSON: () => ({}) } as MediaDeviceInfo,
+        ];
+      }
+
+      // navigator.userAgentData (UA-CH) — reCAPTCHA v3 uses this on Chromium.
+      const brands = [
+        { brand: 'Google Chrome', version },
+        { brand: 'Chromium', version },
+        { brand: 'Not=A?Brand', version: '99' },
+      ];
+      const uaData = {
+        brands,
+        mobile: false,
+        platform: 'macOS',
+        getHighEntropyValues: () =>
+          Promise.resolve({
+            architecture: 'x86',
+            bitness: '64',
+            brands,
+            fullVersionList: brands,
+            mobile: false,
+            model: '',
+            platform: 'macOS',
+            platformVersion: '10.15.7',
+            uaFullVersion: '10.15.7',
+            wow64: false,
+          }),
+        toJSON: () => ({ brands, mobile: false, platform: 'macOS' }),
+      };
+      Object.defineProperty(navigator, 'userAgentData', { get: () => uaData });
+
+      // WebGL vendor/renderer — Linux Docker reports Mesa/SwiftShader, a dead
+      // giveaway. Spoof an Apple GPU string that matches a real Mac, both on
+      // WebGL1 (WebGLRenderingContext) and WebGL2 (WebGL2RenderingContext).
+      const patchWebGL = (proto: any) => {
+        const original = proto.getParameter;
+        proto.getParameter = function (param: number) {
+          if (param === 37445) return 'Apple Inc.'; // UNMASKED_VENDOR_WEBGL
+          if (param === 37446) return 'Apple M1'; // UNMASKED_RENDERER_WEBGL
+          return original.call(this, param);
+        };
+      };
+      patchWebGL(WebGLRenderingContext.prototype);
+      if (typeof WebGL2RenderingContext !== 'undefined') {
+        patchWebGL(WebGL2RenderingContext.prototype);
+      }
+    }, majorVersion);
+    return chromeVersion;
+  }
+
+  /**
+   * Copy the saved Zoom profile (if any) to a per-session scratch directory,
+   * so concurrent meetings don't fight over Chrome's SingletonLock on the
+   * shared profile. Returns the scratch dir, or undefined if no saved profile.
+   */
+  private async cloneProfileForSession(
+    meetingNumber: string,
+  ): Promise<string | undefined> {
+    if (!(await this.isLoggedIn())) {
+      return undefined;
+    }
+    const src = this.zoomProfileDir();
+    const dst = pathJoin(tmpdir(), `zoom-profile-${meetingNumber}-${Date.now()}`);
+    // Skip files that encode host-machine identity or stale lock state.
+    // Chromium regenerates these; copying them from a host-created profile
+    // into a container causes "another computer owns this profile" refusals
+    // or outright crashes (Local State holds an OS-keyring-encrypted key).
+    const SKIP = /\/(Singleton(Lock|Cookie|Socket)|lockfile|Local State|RunningChromeVersion)$/;
+    await fs.cp(src, dst, {
+      recursive: true,
+      filter: (source) => !SKIP.test(source),
+    });
+    // Clear the "last run crashed" flag so Chromium doesn't try to show a
+    // restore prompt (which, in headless, just stalls the handshake).
+    await this.clearCrashedExitFlag(dst);
+    return dst;
+  }
+
+  /** Rewrite exit_type / exited_cleanly in Preferences so Chrome doesn't nag. */
+  private async clearCrashedExitFlag(profileDir: string): Promise<void> {
+    const prefsPath = pathJoin(profileDir, 'Default', 'Preferences');
+    try {
+      const raw = await fs.readFile(prefsPath, 'utf8');
+      const prefs = JSON.parse(raw);
+      if (prefs?.profile) {
+        prefs.profile.exit_type = 'Normal';
+        prefs.profile.exited_cleanly = true;
+        await fs.writeFile(prefsPath, JSON.stringify(prefs));
+      }
+    } catch {
+      // No Preferences yet, or unreadable — Chromium will create a fresh one.
+    }
+  }
+
+  private async launchBrowser(userDataDir?: string): Promise<Browser> {
     const headless =
       this.config.get<string>('PUPPETEER_HEADLESS', 'true') !== 'false';
+    const dumpio =
+      this.config.get<string>('PUPPETEER_DUMPIO', 'false') === 'true';
     return puppeteer.launch({
+      // In Puppeteer v22+, headless:true uses Chrome's new headless mode
+      // (same renderer as a real browser window), not the legacy shell.
       headless,
+      userDataDir,
+      dumpio,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        // Chrome 137+ deprecated the automatic software-WebGL fallback.
+        // Inside this container there is no real GPU, so Zoom's WebGL-based
+        // video pipeline fails to initialise and the client silently exits
+        // right after login. Opt in to the SwiftShader software renderer.
+        '--enable-unsafe-swiftshader',
+        // Suppress the "Chrome is being controlled by automated software" flag
+        // and the navigator.webdriver JS property that Zoom's detection reads.
+        '--disable-blink-features=AutomationControlled',
         // Supply fake audio/video so Zoom's getUserMedia resolves instead of
         // hanging on a non-existent camera/mic, and so no permission prompt
-        // blocks the flow. This is about not stalling in a headless container,
-        // not about hiding what the bot is.
+        // blocks the flow.
         '--use-fake-ui-for-media-stream',
         '--use-fake-device-for-media-stream',
         '--autoplay-policy=no-user-gesture-required',
@@ -699,6 +1096,11 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
         const text = document.body.innerText;
         if (/incorrect (password|passcode)|(password|passcode) (is )?(wrong|incorrect)/i.test(text)) {
           return 'wrong-passcode';
+        }
+        // Zoom's explicit bot-block message — treat same as sign-in-required so
+        // the join fails fast instead of looping for 5 minutes.
+        if (/automated bots? (aren['’]t|are not) allowed/i.test(text)) {
+          return 'sign-in-required';
         }
         if (/sign in to join|authorized attendees only|only authenticated users/i.test(text)) {
           return 'sign-in-required';
