@@ -545,29 +545,26 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Open Zoom's sign-in page in a (non-headless) browser, fill in the
-   * credentials from env, wait for the dashboard to load, then close.
-   * The Chromium profile is persisted to disk so every subsequent `join`
-   * reuses the authenticated session.
-   *
-   * @throws if credentials are missing, the login form is not found, or
-   *         Zoom rejects the password.
+   * Open Zoom's sign-in page in a visible browser so the operator can log in
+   * by hand (CAPTCHA / 2FA / SSO all happen manually). ZOOM_EMAIL /
+   * ZOOM_PASSWORD are *optional* — if present, we pre-fill them to save
+   * typing, but we never block on them. The call returns as soon as Zoom
+   * takes the user off `/signin`, which is the signal that the session
+   * cookie + localStorage are now written to the persisted profile.
    */
   async loginWithAccount(): Promise<void> {
     const email = this.config.get<string>('ZOOM_EMAIL', '').trim();
     const password = this.config.get<string>('ZOOM_PASSWORD', '').trim();
-    if (!email || !password) {
-      throw new Error(
-        'ZOOM_EMAIL and ZOOM_PASSWORD must be set in the environment before logging in.',
-      );
-    }
 
     const profileDir = this.zoomProfileDir();
     await fs.mkdir(profileDir, { recursive: true });
-    this.logger.log(`Starting Zoom login for ${email} (profile: ${profileDir})`);
+    this.logger.log(
+      `Starting Zoom login (profile: ${profileDir}). ` +
+        'A browser window will open — finish the sign-in by hand.',
+    );
 
-    // Use a visible browser for login so any CAPTCHA can be spotted; set
-    // PUPPETEER_HEADLESS=false in .env while debugging if needed.
+    // Login MUST happen in a visible browser so a human can solve
+    // CAPTCHA/2FA. Honour PUPPETEER_HEADLESS=false explicitly here.
     const browser = await this.launchBrowser(profileDir);
     const page = await browser.newPage();
     try {
@@ -575,126 +572,89 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
       await this.spoofMacFingerprint(browser, page);
 
       this.logger.log('Navigating to Zoom sign-in page…');
-      await page.goto('https://zoom.us/signin', {
-        waitUntil: 'networkidle2',
-        timeout: 60_000,
-      });
+      // domcontentloaded is good enough — Zoom's sign-in is a client-side
+      // app, networkidle2 can hang forever behind background pings.
+      await page
+        .goto('https://zoom.us/signin', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60_000,
+        })
+        .catch((e) => this.logger.warn(`Sign-in page navigation hiccup: ${e}`));
 
-      // If already signed in, Zoom redirects to /profile.
-      if (/\/profile/i.test(new URL(page.url()).pathname)) {
-        this.logger.log('Already signed in to Zoom.');
+      // If already signed in, Zoom redirects straight to /profile.
+      if (!/\/signin/i.test(new URL(page.url()).pathname)) {
+        this.logger.log(`Already signed in (${page.url()}).`);
         return;
       }
 
-      // The cookie banner sits on top of the Next button and blocks clicks.
       await this.dismissCookieBanner(page);
 
-      // Zoom's sign-in is a two-step flow: fill email → click Next → the
-      // password field is only mounted after email is accepted. Supporting
-      // both the new (#email_input, #zm_signin_email) and old (#email) ids.
-      const emailFilled = await this.typeIntoFirst(
-        page,
-        ['#email_input', '#zm_signin_email', '#email', 'input[name="email"]', 'input[type="email"]'],
-        email,
-        15_000,
-      );
-      if (!emailFilled) {
-        throw new Error('Could not find the email field on the Zoom sign-in page.');
-      }
-
-      // Click the "Next" button that advances to the password step. Some
-      // layouts put a submit button here; others use a button labelled Next.
-      const nextClicked = await page.evaluate(() => {
-        const candidates = Array.from(
-          document.querySelectorAll<HTMLButtonElement>('button, input[type="submit"]'),
-        );
-        const next = candidates.find((b) => {
-          const label = (b.getAttribute('aria-label') || b.textContent || (b as HTMLInputElement).value || '').trim();
-          return /^next$/i.test(label) || /continue/i.test(label);
-        });
-        if (next) {
-          next.click();
-          return true;
-        }
-        return false;
-      });
-      if (!nextClicked) {
-        this.logger.warn('No "Next" button found; assuming legacy one-step sign-in form.');
-      }
-
-      // Password field appears after Next; give it a generous timeout because
-      // Zoom may do a round-trip to validate the email first.
-      const pwFilled = await this.typeIntoFirst(
-        page,
-        ['#password', '#password_input', 'input[name="password"]', 'input[type="password"]'],
-        password,
-        20_000,
-      );
-      if (!pwFilled) {
-        // If the email was rejected (unknown account, SSO-only, …) Zoom shows
-        // an inline error on the email step instead of moving on.
-        const bodyText = await page.evaluate(() => document.body.innerText);
-        if (/can.?t find.*account|no account|use (your )?SSO|single sign.?on/i.test(bodyText)) {
-          throw new Error(
-            'Zoom did not accept this email on the sign-in page — the account ' +
-              'may not exist, or it requires SSO (which this bot cannot use).',
+      // Best-effort pre-fill of email + password. These are nice-to-haves;
+      // Zoom frequently gates the form behind a CAPTCHA or shows an SSO/OAuth
+      // layout where the fields aren't immediately visible. Swallow errors so
+      // the operator can just finish the form manually.
+      if (email) {
+        const filled = await this.typeIntoFirst(
+          page,
+          [
+            '#email_input',
+            '#zm_signin_email',
+            '#email',
+            'input[name="email"]',
+            'input[type="email"]',
+          ],
+          email,
+          10_000,
+        ).catch(() => false);
+        if (filled) {
+          this.logger.log('Pre-filled email. Finish any CAPTCHA / 2FA by hand.');
+        } else {
+          this.logger.log(
+            'Could not pre-fill the email field (CAPTCHA / SSO layout?). ' +
+              'Please complete the sign-in by hand in the browser window.',
           );
         }
-        throw new Error(
-          'Password field never appeared after submitting the email. Zoom may be ' +
-            'showing a CAPTCHA or extra challenge — check the debug screenshot.',
-        );
+      }
+      if (password) {
+        await this.typeIntoFirst(
+          page,
+          [
+            '#password',
+            '#password_input',
+            'input[name="password"]',
+            'input[type="password"]',
+          ],
+          password,
+          5_000,
+        ).catch(() => undefined);
       }
 
-      // Click Sign In.
-      await page.evaluate(() => {
-        const candidates = Array.from(
-          document.querySelectorAll<HTMLButtonElement>('button, input[type="submit"]'),
-        );
-        const signIn = candidates.find((b) => {
-          const label = (b.getAttribute('aria-label') || b.textContent || (b as HTMLInputElement).value || '').trim();
-          return /^sign ?in$/i.test(label) || /^log ?in$/i.test(label);
-        });
-        if (signIn) {
-          signIn.click();
-        } else {
-          // Fallback: any submit button on the form.
-          const anySubmit = document.querySelector<HTMLButtonElement>('button[type="submit"], input[type="submit"]');
-          anySubmit?.click();
-        }
-      });
-
-      // Wait until Zoom leaves the sign-in page. We can't just wait for a
-      // hard navigation because Zoom's post-login flow is a client-side
-      // route change (no full reload), which makes waitForNavigation hit
-      // its timeout even when login actually succeeded. Instead, poll the
-      // URL. 2FA/CAPTCHA pages still live under /signin, so this also
-      // gives the user time to solve them manually.
-      await page
+      this.logger.log(
+        'Waiting up to 5 minutes for sign-in to complete… ' +
+          '(URL leaves /signin → success)',
+      );
+      const left = await page
         .waitForFunction(() => !/\/signin\b/i.test(location.pathname), {
-          timeout: 180_000,
+          timeout: 300_000,
           polling: 1000,
         })
-        .catch(() => undefined);
+        .then(() => true)
+        .catch(() => false);
 
-      const finalUrl = page.url();
-      if (/\/signin/i.test(new URL(finalUrl).pathname)) {
-        // Still on the sign-in page — wrong credentials or CAPTCHA.
-        const bodyText = await page.evaluate(() => document.body.innerText);
-        if (/invalid|incorrect|wrong|error/i.test(bodyText)) {
-          throw new Error(
-            'Zoom rejected the credentials (wrong email or password).',
-          );
-        }
+      if (!left) {
         throw new Error(
-          'Still on the sign-in page after submitting — a CAPTCHA or 2-step ' +
-            'verification may be blocking the login. Check ZOOM_DEBUG_SCREENSHOTS.',
+          'Timed out after 5 minutes still on the sign-in page. ' +
+            'Try /zoomlogin again and finish faster, or check for a ' +
+            'blocking CAPTCHA / 2FA prompt.',
         );
       }
 
-      this.logger.log(`Zoom login succeeded (landed on ${finalUrl})`);
+      // Give Chrome a beat to flush cookies + Local State to disk before
+      // we close it — otherwise the on-disk profile may be missing the
+      // session cookie we just acquired.
+      await this.sleep(2000);
+      this.logger.log(`Zoom login succeeded (landed on ${page.url()}).`);
     } catch (err) {
-      // Save a debug screenshot before re-throwing.
       await this.captureDebugScreenshot(page, 'zoom-login-failed');
       throw err;
     } finally {

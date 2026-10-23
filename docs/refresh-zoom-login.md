@@ -50,6 +50,7 @@ ls zoom-profile/Default/Cookies   # must exist
 
 Stop the local bot (`Ctrl+C`).
 
+
 ### 3. Pack it
 
 ```bash
