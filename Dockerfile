@@ -123,10 +123,10 @@ ENV NODE_ENV=production \
 # ── 6. Expose health-check port ───────────────────────────────────────────────
 EXPOSE 3000
 
-# ── 7. Volumes for persistent data ───────────────────────────────────────────
-#    zoom-profile  — Chromium login session (re-used across restarts)
-#    debug-screenshots — failure screenshots accessible from the host
-VOLUME ["/app/zoom-profile", "/app/debug-screenshots"]
+# Note: persistent storage is declared via Railway's Volume UI (mounted at
+# /app/zoom-profile), not a Dockerfile VOLUME directive — Railway rejects
+# VOLUME. For local docker-compose runs, the bind mounts in
+# docker-compose.yml handle the same thing.
 
 # ── 8. Health check ───────────────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
