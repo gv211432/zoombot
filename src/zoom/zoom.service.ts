@@ -657,8 +657,18 @@ export class ZoomService implements OnModuleInit, OnModuleDestroy {
         }
       });
 
-      // Wait for post-login navigation (profile page, or 2FA, etc.).
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60_000 });
+      // Wait until Zoom leaves the sign-in page. We can't just wait for a
+      // hard navigation because Zoom's post-login flow is a client-side
+      // route change (no full reload), which makes waitForNavigation hit
+      // its timeout even when login actually succeeded. Instead, poll the
+      // URL. 2FA/CAPTCHA pages still live under /signin, so this also
+      // gives the user time to solve them manually.
+      await page
+        .waitForFunction(() => !/\/signin\b/i.test(location.pathname), {
+          timeout: 180_000,
+          polling: 1000,
+        })
+        .catch(() => undefined);
 
       const finalUrl = page.url();
       if (/\/signin/i.test(new URL(finalUrl).pathname)) {
